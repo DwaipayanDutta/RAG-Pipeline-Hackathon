@@ -1,0 +1,355 @@
+RAG Pipeline Coding Challenge - Titan Company Annual Report 2025-26
+
+Your task is to build a Retrieval-Augmented Generation (RAG) pipeline end-to-end using Python only.
+
+You will be provided with:
+
+- A multi-page Titan Company Limited Integrated Annual Report 2025-26 PDF containing text, tables, financial information, business-unit information, and governance/strategy disclosures.
+- A set of queries that must be answered only using information contained in the PDF.
+
+Your goal is to implement a working RAG system that:
+
+1. Extracts information from the Titan annual report
+2. Creates embeddings and builds a vector store
+3. Retrieves relevant chunks for a query
+4. Uses an open-source LLM for generation
+5. Produces accurate answers grounded in the annual report
+
+============================================================
+PROBLEM DESCRIPTION
+============================================================
+
+You are required to build a complete RAG pipeline that performs the following steps.
+
+============================================================
+1. PDF DATA EXTRACTION
+============================================================
+
+Extract all meaningful content from the Titan Annual Report, including:
+
+- Page text
+- Tables
+- Financial statements
+- Business-unit performance information
+- KPI tables
+- Store/network information
+- Strategy and operational initiatives
+- Risk-management and governance information
+- Other relevant structured/grid content
+
+You may use any Python PDF library, for example:
+
+- pdfplumber
+- PyMuPDF
+- pypdf
+- camelot
+- tabula
+
+The extracted content should retain enough metadata to identify its original location in the report.
+
+============================================================
+2. TEXT CHUNKING
+============================================================
+
+Split the extracted content into smaller chunks.
+
+Requirements:
+
+- Use fixed-size chunks
+- Chunk size may be token-based or word-based
+- Some overlap is recommended
+- Preserve document metadata
+
+Each chunk should ideally contain:
+
+{
+  "chunk_id": 42,
+  "page": 137,
+  "source_type": "text",
+  "text": "..."
+}
+
+For tables, additional metadata such as table_id may be maintained.
+
+Recommended approach:
+
+Chunk size: 300-500 words
+Overlap: 50-75 words
+
+The exact values are up to you.
+
+============================================================
+3. EMBEDDING GENERATION
+============================================================
+
+Convert all document chunks into vector embeddings using an open-source embedding model.
+
+You may use models such as:
+
+- sentence-transformers/all-MiniLM-L6-v2
+- Any comparable free Sentence Transformer model available through Hugging Face
+
+The same embedding model must be used for:
+
+Document chunks + User queries
+
+The resulting vectors should be suitable for semantic similarity search.
+
+============================================================
+4. VECTOR DATABASE / INDEX
+============================================================
+
+Store the generated embeddings in an efficient vector index.
+
+Recommended:
+
+- FAISS
+
+Alternatives:
+
+- Annoy
+- HNSWlib
+- Custom cosine-similarity implementation
+
+The vector store should support:
+
+Query embedding
+    ->
+Similarity search
+    ->
+Top-K relevant chunks
+
+For example:
+
+Top-K = 5
+
+You may choose an appropriate value.
+
+If using FAISS, you may use normalized embeddings with IndexFlatIP to perform cosine-similarity-style retrieval.
+
+============================================================
+5. RETRIEVAL FOR A QUERY
+============================================================
+
+For every query:
+
+1. Convert the query into an embedding
+2. Search the vector index
+3. Retrieve the most relevant chunks
+4. Preserve their page/chunk metadata
+5. Build a context prompt from the retrieved evidence
+
+The retrieved chunks should contain enough evidence to answer the question.
+
+============================================================
+6. LLM-BASED ANSWER GENERATION
+============================================================
+
+Use a free/open-source model available through Hugging Face.
+
+Examples:
+
+- google/flan-t5-small
+- google/flan-t5-base
+- tiiuae/falcon-rw-1b
+- Any other suitable open-source model
+
+No paid API key should be required.
+
+The model must answer only from the retrieved Titan Annual Report context.
+
+Grounding requirements:
+
+- Do not use outside knowledge
+- Do not invent facts
+- Do not guess missing values
+- Preserve exact numbers and units
+- Use table values exactly where applicable
+- If the answer cannot be supported by the retrieved document context, return:
+
+"I don't know from the document."
+
+============================================================
+7. EVALUATION QUERIES
+============================================================
+
+The following queries should be used to evaluate the RAG pipeline.
+
+Query 1 - Causal / Semantic Retrieval
+
+What were the key factors that contributed to the growth of Titan's Jewellery Division during FY2025-26?
+
+Query 2 - Financial Table Retrieval
+
+List the key financial performance indicators for Titan Company on a consolidated basis for FY2025-26 and FY2024-25.
+
+Query 3 - Numerical Filtering
+
+Which Titan business divisions recorded double-digit growth during FY2025-26, and what were their respective growth rates?
+
+Query 4 - Business Performance Retrieval
+
+What were the turnover and profit-before-tax figures reported for CaratLane for FY2025-26?
+
+Query 5 - Threshold Query
+
+Which Titan businesses had revenue or turnover exceeding INR 5,000 crore during FY2025-26?
+
+Query 6 - Strategy / Initiative Retrieval
+
+What were the major components of Tanishq's Retail Transformation programme during FY2025-26?
+
+Query 7 - Multi-section Retrieval
+
+What initiatives did Titan undertake to improve transparency and consumer confidence in diamonds?
+
+Query 8 - Exact Factual Retrieval
+
+What was Titan's investment in increasing its stake in CaratLane, and what was the resulting ownership level?
+
+Query 9 - Cross-section Retrieval
+
+How did Titan combine physical retail expansion with omnichannel capabilities across its Jewellery businesses?
+
+Query 10 - Policy / Governance Retrieval
+
+What are the key processes and controls described in Titan's risk management framework?
+
+============================================================
+8. OUT-OF-DOCUMENT / HALLUCINATION TEST
+============================================================
+
+A robust RAG implementation should also be tested with at least one question whose answer is not available in the annual report.
+
+Example:
+
+What was Titan Company's total revenue in FY2027?
+
+If FY2027 information is not present in the supplied report, the system must return:
+
+"I don't know from the document."
+
+This is important because the system should demonstrate that it can refuse to answer when evidence is unavailable rather than hallucinating an answer.
+
+============================================================
+9. FINAL OUTPUT
+============================================================
+
+Your final output must be a JSON file containing the answer for every query.
+
+Expected structure:
+
+[
+  {
+    "query": "What were the key factors that contributed to the growth of Titan's Jewellery Division during FY2025-26?",
+    "answer": "...",
+    "retrieved_chunks": [
+      {
+        "page": 123,
+        "score": 0.81
+      },
+      {
+        "page": 127,
+        "score": 0.76
+      }
+    ]
+  }
+]
+
+You may optionally include additional metadata such as:
+
+{
+  "page": 123,
+  "chunk_id": 42,
+  "source_type": "text",
+  "score": 0.81
+}
+
+This makes the RAG system easier to audit.
+
+============================================================
+10. SUBMISSION REQUIREMENTS
+============================================================
+
+Submit the following:
+
+1. Python implementation
+
+Either:
+
+rag_pipeline.py
+
+or:
+
+rag_pipeline.ipynb
+
+The implementation should contain the complete pipeline:
+
+PDF extraction
+    ->
+Cleaning
+    ->
+Chunking
+    ->
+Embedding generation
+    ->
+FAISS index
+    ->
+Query embedding
+    ->
+Top-K retrieval
+    ->
+Context construction
+    ->
+LLM generation
+    ->
+JSON output
+
+2. Generated answers
+
+Submit:
+
+results.json
+
+containing the answers generated for all evaluation queries.
+
+============================================================
+EXPECTED PROJECT STRUCTURE
+============================================================
+
+Titan-RAG/
+|
+├── rag_pipeline.py
+├── queries.json
+├── results.json
+├── requirements.txt
+├── README.md
+|
+├── sample_titan_report.pdf
+|
+├── rag_index.faiss
+├── rag_metadata.json
+└── rag_config.json
+
+The FAISS index and metadata files can be generated by the pipeline rather than manually supplied, if desired.
+
+============================================================
+EVALUATION FOCUS
+============================================================
+
+The implementation will primarily be evaluated on:
+
+- PDF extraction: Text and tables extracted correctly
+- Chunking: Fixed-size chunks and overlap
+- Metadata: Page/chunk/source information preserved
+- Embeddings: Appropriate semantic embedding model
+- Vector search: Correct Top-K retrieval
+- Retrieval quality: Relevant evidence retrieved
+- Table handling: Ability to answer table/KPI questions
+- Numerical queries: Correct filtering/comparison
+- Generation: Accurate document-grounded answers
+- Hallucination control: Correct "I don't know from the document." behavior
+- Traceability: Retrieved pages/chunks reported
+- Code quality: Modular, readable Python implementation
+
+The strongest submission should demonstrate not just that an LLM can answer the questions, but that the answer is supported by the correct sections of the Titan Annual Report.

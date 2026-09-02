@@ -3,7 +3,8 @@
 Production-Grade RAG Pipeline for Financial Annual Reports.
 
 Implements hybrid retrieval (dense + BM25 + RRF), optional reranking,
-structured table extraction, entity/metric/fiscal-year grounding,
+structured table extraction with header-aware column mapping,
+entity/metric/fiscal-year grounding, deterministic numerical reasoning,
 and a multi-layer refusal mechanism.
 """
 import argparse
@@ -16,7 +17,7 @@ import pickle
 import sys
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple, Union, Set
+from typing import List, Dict, Any, Optional, Tuple, Set
 from collections import defaultdict
 
 import numpy as np
@@ -24,7 +25,7 @@ import pdfplumber
 from sentence_transformers import SentenceTransformer
 import faiss
 from rank_bm25 import BM25Okapi
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, pipeline
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 import torch
 
 # -------------------------------------------------------------------------
@@ -52,6 +53,8 @@ class EvidenceRecord:
     chunk_id: int
     source_text: str = ""
     source_type: str = "text"  # "text" or "table"
+    is_percentage: bool = False
+
 
 @dataclass
 class Chunk:
@@ -65,6 +68,7 @@ class Chunk:
     embedding: Optional[np.ndarray] = None
     evidence_records: List[EvidenceRecord] = field(default_factory=list)
 
+
 @dataclass
 class QueryResult:
     query: str
@@ -77,6 +81,7 @@ class QueryResult:
     retrieved_chunks: List[Dict[str, Any]]
     validation: Dict[str, bool]
     refusal_reason: Optional[str] = None
+
 
 # -------------------------------------------------------------------------
 # Configuration
@@ -98,6 +103,7 @@ DEFAULT_CONFIG = {
     "index_dir": "index_cache",
 }
 
+
 def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
     config = DEFAULT_CONFIG.copy()
     if config_path and os.path.exists(config_path):
@@ -105,6 +111,7 @@ def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
             user_config = json.load(f)
             config.update(user_config)
     return config
+
 
 # -------------------------------------------------------------------------
 # Utilities
@@ -114,6 +121,7 @@ def normalize_text(text: str) -> str:
     text = re.sub(r"\s+", " ", text).strip()
     return text.lower()
 
+
 def compute_sha256(file_path: str) -> str:
     """Compute SHA-256 hash of a file."""
     sha256 = hashlib.sha256()
@@ -122,24 +130,25 @@ def compute_sha256(file_path: str) -> str:
             sha256.update(block)
     return sha256.hexdigest()
 
+
 def safe_float(value_str: str) -> Optional[float]:
     """Convert a string to float, handling commas and currency symbols."""
     if not value_str:
         return None
-    # Remove currency symbols, commas, and units
-    cleaned = re.sub(r"[₹$,€£\s]", "", value_str)
+    cleaned = re.sub(r"[₹$,€£\s]", "", str(value_str))
     cleaned = re.sub(r"[^0-9.\-]", "", cleaned)
     try:
         return float(cleaned)
     except ValueError:
         return None
 
+
 def extract_fiscal_years(text: str) -> List[str]:
     """Extract fiscal year strings like FY2025-26, 2025-26, etc."""
     patterns = [
-        r"FY\s*(\d{4})\s*[-–]\s*(\d{2})",  # FY2025-26
-        r"(\d{4})\s*[-–]\s*(\d{2})",        # 2025-26
-        r"FY\s*(\d{2})\s*[-–]\s*(\d{2})",   # FY25-26
+        r"FY\s*(\d{4})\s*[-–]\s*(\d{2})",
+        r"(\d{4})\s*[-–]\s*(\d{2})",
+        r"FY\s*(\d{2})\s*[-–]\s*(\d{2})",
     ]
     years = []
     for pat in patterns:
@@ -150,14 +159,14 @@ def extract_fiscal_years(text: str) -> List[str]:
                     y1_full = y1
                 else:
                     y1_full = f"20{y1}" if int(y1) >= 20 else f"19{y1}"
-                y2_full = f"{y1_full[:2]}{y2}"  # assume same century
+                y2_full = f"{y1_full[:2]}{y2}"
                 fy = f"FY{y1_full}-{y2_full[2:]}"
                 years.append(fy)
     return list(set(years))
 
+
 def extract_entities(text: str) -> List[str]:
     """Simple entity extraction based on known business names."""
-    # This list can be extended or loaded from config.
     entities = []
     known = [
         "Titan Company", "Titan", "Jewellery", "Tanishq", "CaratLane",
@@ -169,11 +178,12 @@ def extract_entities(text: str) -> List[str]:
             entities.append(ent)
     return list(set(entities))
 
+
 def extract_metrics(text: str) -> List[str]:
     """Recognise common financial metrics."""
     metric_map = {
         "revenue": ["revenue", "turnover", "sales"],
-        "profit_before_tax": ["profit before tax", "pbt", "profit-before-tax"],
+        "profit_before_tax": ["profit before tax", "pbt", "profit-before-tax", "profit before taxation"],
         "profit_after_tax": ["profit after tax", "pat", "net profit"],
         "ebitda": ["ebitda"],
         "growth": ["growth", "increase", "decrease"],
@@ -190,28 +200,56 @@ def extract_metrics(text: str) -> List[str]:
                 break
     return found
 
-def extract_numeric_value(text: str) -> Optional[float]:
-    """Extract a single numeric value from text (first occurrence)."""
-    # Remove fiscal years (like 2025-26) to avoid confusion
-    cleaned = re.sub(r"\d{4}\s*[-–]\s*\d{2}", "", text)
-    matches = re.findall(r"(\d{1,3}(?:,\d{3})*(?:\.\d+)?)", cleaned)
-    if matches:
-        return safe_float(matches[0])
-    return None
+
+def parse_financial_value(text: str) -> Tuple[Optional[float], Optional[str], bool]:
+    """
+    Parse a financial value from text.
+    Returns (value, unit, is_percentage).
+    """
+    text = str(text).strip()
+    if not text:
+        return None, None, False
+
+    # Check if it's a percentage
+    is_pct = "%" in text
+    # Remove currency symbols and commas
+    cleaned = re.sub(r"[₹$,€£]", "", text)
+    # Extract number
+    match = re.search(r"(\d{1,3}(?:,\d{3})*(?:\.\d+)?)", cleaned)
+    if not match:
+        return None, None, False
+    val = safe_float(match.group(1))
+    if val is None:
+        return None, None, False
+
+    # Determine unit
+    unit = None
+    if is_pct:
+        unit = "percent"
+    elif "crore" in text.lower():
+        unit = "INR crore"
+    elif "million" in text.lower():
+        unit = "INR million"
+    elif "billion" in text.lower():
+        unit = "INR billion"
+    elif "lakh" in text.lower():
+        unit = "INR lakh"
+    elif "₹" in text or "rs" in text.lower():
+        unit = "INR"
+
+    return val, unit, is_pct
+
 
 def parse_threshold(query: str) -> Optional[Dict[str, Any]]:
     """
     Parse threshold queries like "exceeding 5000 crore", "above 10%".
     Returns dict with metric, operator, threshold, unit, fiscal_year.
     """
-    # Simple regex based extraction
-    # Operator
     op_pattern = r"\b(exceeding|greater than|above|more than|at least|below|less than|at most)\b"
     op_match = re.search(op_pattern, query, re.IGNORECASE)
     if not op_match:
         return None
     op = op_match.group(1).lower()
-    # Map to operator
     op_map = {
         "exceeding": ">",
         "greater than": ">",
@@ -223,8 +261,8 @@ def parse_threshold(query: str) -> Optional[Dict[str, Any]]:
         "at most": "<=",
     }
     operator = op_map.get(op, ">")
+
     # Extract number and unit
-    # e.g., "5,000 crore", "10%", "INR 5,000 crore"
     num_pattern = r"(\d{1,3}(?:,\d{3})*(?:\.\d+)?)\s*(?:%|crore|million|billion|INR|₹)?"
     num_match = re.search(num_pattern, query)
     if not num_match:
@@ -233,7 +271,7 @@ def parse_threshold(query: str) -> Optional[Dict[str, Any]]:
     threshold = safe_float(value_str)
     if threshold is None:
         return None
-    # Determine unit
+
     unit = None
     if "crore" in query:
         unit = "INR crore"
@@ -243,10 +281,9 @@ def parse_threshold(query: str) -> Optional[Dict[str, Any]]:
         unit = "INR million"
     elif "billion" in query:
         unit = "INR billion"
-    # Fiscal year (if mentioned)
+
     fiscal_years = extract_fiscal_years(query)
     fy = fiscal_years[0] if fiscal_years else None
-    # Metric (try to infer from query)
     metrics = extract_metrics(query)
     metric = metrics[0] if metrics else None
 
@@ -258,14 +295,12 @@ def parse_threshold(query: str) -> Optional[Dict[str, Any]]:
         "metric": metric,
     }
 
+
 # -------------------------------------------------------------------------
 # PDF Ingestion
 # -------------------------------------------------------------------------
 def extract_pdf_content(pdf_path: str) -> Tuple[List[Dict], List[Dict]]:
-    """
-    Extract text and tables from PDF.
-    Returns (pages_text, tables_list) where each table is a dict with page, rows, etc.
-    """
+    """Extract text and tables from PDF."""
     pages_text = []
     tables = []
     try:
@@ -273,12 +308,10 @@ def extract_pdf_content(pdf_path: str) -> Tuple[List[Dict], List[Dict]]:
             for page_num, page in enumerate(pdf.pages, start=1):
                 text = page.extract_text() or ""
                 pages_text.append({"page": page_num, "text": text})
-                # Extract tables
                 page_tables = page.extract_tables()
                 for table_idx, table in enumerate(page_tables):
                     if not table:
                         continue
-                    # Convert to list of rows with header detection
                     headers = table[0] if table else []
                     rows = []
                     for row in table[1:]:
@@ -297,86 +330,170 @@ def extract_pdf_content(pdf_path: str) -> Tuple[List[Dict], List[Dict]]:
         raise
     return pages_text, tables
 
+
 # -------------------------------------------------------------------------
-# Table Normalization
+# Header-Aware Table Normalization
 # -------------------------------------------------------------------------
 def normalize_table(table_dict: Dict) -> List[Dict[str, Any]]:
     """
-    Convert a table into a list of structured rows with context.
-    Each row includes page, table_id, headers, unit, fiscal years, etc.
+    Convert a table into structured rows with header-aware column mapping.
+    Handles multi-row headers by combining them.
     """
     page = table_dict["page"]
     table_id = table_dict["table_id"]
     headers = table_dict["headers"]
     rows = table_dict["rows"]
-    # Try to detect unit from headers or first row
-    unit = None
-    for cell in headers:
-        if cell and isinstance(cell, str) and ("cr" in cell.lower() or "₹" in cell):
-            unit = "INR crore"
-            break
-    if not unit:
-        # check first row for crore
-        for row in rows:
-            for cell in row:
-                if cell and isinstance(cell, str) and ("cr" in cell.lower() or "₹" in cell):
-                    unit = "INR crore"
-                    break
-            if unit:
-                break
 
-    # Extract fiscal years from headers or table text
-    all_text = " ".join(str(cell) for row in rows for cell in row if cell)
-    fiscal_years = extract_fiscal_years(all_text)
+    # Clean headers: replace None with empty string
+    clean_headers = [str(h).strip() if h else "" for h in headers]
 
+    # Detect if we have multi-row headers (common in financial tables)
+    # Try to identify fiscal years and metrics in headers
+    header_fys = []
+    header_metrics = []
+    for h in clean_headers:
+        fys = extract_fiscal_years(h)
+        if fys:
+            header_fys.extend(fys)
+        metrics = extract_metrics(h)
+        if metrics:
+            header_metrics.extend(metrics)
+
+    # If we have fiscal years in headers, map each column to (fy, metric)
+    col_mapping = []
+    for col_idx, h in enumerate(clean_headers):
+        fys = extract_fiscal_years(h)
+        metrics = extract_metrics(h)
+        if fys and metrics:
+            # Column contains both FY and metric
+            for fy in fys:
+                for met in metrics:
+                    col_mapping.append((col_idx, fy, met))
+        elif fys:
+            # Column is just a fiscal year; look for metric in adjacent columns or use default
+            # We'll infer metric from row context later
+            for fy in fys:
+                col_mapping.append((col_idx, fy, None))
+        elif metrics:
+            # Column is just a metric; look for fiscal year in adjacent columns
+            for met in metrics:
+                col_mapping.append((col_idx, None, met))
+        else:
+            # No FY or metric; assume it's a label column
+            col_mapping.append((col_idx, None, None))
+
+    # If we couldn't map columns, fall back to simple approach
+    if not any(cm[1] or cm[2] for cm in col_mapping):
+        # Simple: first column is entity, subsequent columns are values
+        # Try to detect fiscal years from the table text
+        all_text = " ".join(str(cell) for row in rows for cell in row if cell)
+        fiscal_years = extract_fiscal_years(all_text)
+        structured_rows = []
+        for row_idx, row in enumerate(rows):
+            row_data = {}
+            for col_idx, cell in enumerate(row):
+                col_name = clean_headers[col_idx] if col_idx < len(clean_headers) else f"col_{col_idx}"
+                row_data[col_name] = cell
+            entity = None
+            if row_data:
+                first_key = list(row_data.keys())[0]
+                entity_val = row_data.get(first_key)
+                if entity_val and isinstance(entity_val, str):
+                    entity = entity_val.strip()
+            numeric_values = []
+            for key, val in row_data.items():
+                if val and isinstance(val, str):
+                    num, unit, is_pct = parse_financial_value(val)
+                    if num is not None:
+                        numeric_values.append((key, num, val, unit, is_pct))
+            structured_rows.append({
+                "page": page,
+                "table_id": table_id,
+                "headers": clean_headers,
+                "row_data": row_data,
+                "entity": entity,
+                "numeric_values": numeric_values,
+                "fiscal_years": fiscal_years,
+                "col_mapping": col_mapping,
+                "raw_row": row,
+            })
+        return structured_rows
+
+    # Advanced mapping: use col_mapping to assign each numeric cell to a (fy, metric)
     structured_rows = []
     for row_idx, row in enumerate(rows):
         row_data = {}
         for col_idx, cell in enumerate(row):
-            if col_idx < len(headers):
-                col_name = headers[col_idx] if headers[col_idx] else f"col_{col_idx}"
-                row_data[col_name] = cell
-            else:
-                row_data[f"col_{col_idx}"] = cell
-        # Try to identify entity name (first column)
+            col_name = clean_headers[col_idx] if col_idx < len(clean_headers) else f"col_{col_idx}"
+            row_data[col_name] = cell
+
+        # Identify entity from first column
         entity = None
-        if row_data and list(row_data.keys()):
+        if row_data:
             first_key = list(row_data.keys())[0]
             entity_val = row_data.get(first_key)
             if entity_val and isinstance(entity_val, str):
                 entity = entity_val.strip()
-        # Extract numeric values from row
+
+        # Build numeric values with column context
         numeric_values = []
-        for key, val in row_data.items():
-            if val and isinstance(val, str):
-                num = safe_float(val)
-                if num is not None:
-                    numeric_values.append((key, num, val))
-        # Build structured row
+        for col_idx, (_, fy, metric) in enumerate(col_mapping):
+            if col_idx >= len(row):
+                continue
+            val_str = row[col_idx]
+            if not val_str or not isinstance(val_str, str):
+                continue
+            num, unit, is_pct = parse_financial_value(val_str)
+            if num is not None:
+                # Infer metric from column header if not mapped
+                if metric is None:
+                    col_name = clean_headers[col_idx] if col_idx < len(clean_headers) else ""
+                    metrics_in_col = extract_metrics(col_name)
+                    metric = metrics_in_col[0] if metrics_in_col else None
+                # Infer fiscal year from column header if not mapped
+                if fy is None:
+                    col_name = clean_headers[col_idx] if col_idx < len(clean_headers) else ""
+                    fys_in_col = extract_fiscal_years(col_name)
+                    fy = fys_in_col[0] if fys_in_col else None
+                numeric_values.append({
+                    "col_idx": col_idx,
+                    "value": num,
+                    "unit": unit,
+                    "is_percentage": is_pct,
+                    "fiscal_year": fy,
+                    "metric": metric,
+                    "source_text": val_str,
+                })
+
+        # Also collect fiscal years from the row text
+        row_text = " ".join(str(cell) for cell in row if cell)
+        row_fys = extract_fiscal_years(row_text)
+
         structured_rows.append({
             "page": page,
             "table_id": table_id,
-            "headers": headers,
+            "headers": clean_headers,
             "row_data": row_data,
             "entity": entity,
             "numeric_values": numeric_values,
-            "unit": unit,
-            "fiscal_years": fiscal_years,
+            "fiscal_years": row_fys,
+            "col_mapping": col_mapping,
             "raw_row": row,
         })
+
     return structured_rows
+
 
 # -------------------------------------------------------------------------
 # Chunking
 # -------------------------------------------------------------------------
 def chunk_text(pages_text: List[Dict], chunk_size: int = 400, overlap: int = 80) -> List[Chunk]:
-    """Split text into overlapping chunks preserving paragraphs and sections."""
+    """Split text into overlapping chunks preserving paragraphs."""
     chunks = []
     chunk_id = 0
     for page_info in pages_text:
         page = page_info["page"]
         text = page_info["text"]
-        # Split into paragraphs (double newline)
         paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
         current_chunk = ""
         for para in paragraphs:
@@ -384,7 +501,6 @@ def chunk_text(pages_text: List[Dict], chunk_size: int = 400, overlap: int = 80)
                 current_chunk += para + "\n"
             else:
                 if current_chunk:
-                    # Save chunk
                     chunks.append(Chunk(
                         chunk_id=chunk_id,
                         page=page,
@@ -394,7 +510,6 @@ def chunk_text(pages_text: List[Dict], chunk_size: int = 400, overlap: int = 80)
                         metadata={"page": page}
                     ))
                     chunk_id += 1
-                    # Overlap: take last overlap characters
                     overlap_text = current_chunk[-overlap:] if overlap else ""
                     current_chunk = overlap_text + para + "\n"
                 else:
@@ -411,6 +526,7 @@ def chunk_text(pages_text: List[Dict], chunk_size: int = 400, overlap: int = 80)
             chunk_id += 1
     return chunks
 
+
 def chunk_tables(tables: List[Dict], chunk_size: int = 400) -> List[Chunk]:
     """Convert each table row into a self-contained text chunk with full context."""
     chunks = []
@@ -418,24 +534,23 @@ def chunk_tables(tables: List[Dict], chunk_size: int = 400) -> List[Chunk]:
     for table_dict in tables:
         structured_rows = normalize_table(table_dict)
         for row in structured_rows:
-            # Build descriptive text for row
-            row_data = row["row_data"]
             entity = row["entity"] or "Unknown"
             fiscal_years = row["fiscal_years"] or []
-            unit = row["unit"] or ""
-            # Create a textual representation
             row_text = f"Table from page {row['page']}\n"
-            if unit:
-                row_text += f"Unit: {unit}\n"
-            if fiscal_years:
-                row_text += f"Fiscal years: {', '.join(fiscal_years)}\n"
             row_text += f"Entity: {entity}\n"
-            for key, val in row_data.items():
+            for key, val in row["row_data"].items():
                 row_text += f"{key}: {val}\n"
-            # Include numeric values explicitly
-            for key, num, orig in row["numeric_values"]:
-                row_text += f"{key}: {orig}\n"
-            # Add chunk
+            # Include numeric values with context
+            for nv in row["numeric_values"]:
+                fy = nv.get("fiscal_year", "")
+                metric = nv.get("metric", "")
+                val = nv.get("value")
+                unit = nv.get("unit", "")
+                if fy:
+                    row_text += f"{metric or 'Value'} ({fy}): {val} {unit}\n".strip()
+                else:
+                    row_text += f"{metric or 'Value'}: {val} {unit}\n".strip()
+
             chunks.append(Chunk(
                 chunk_id=chunk_id,
                 page=row["page"],
@@ -447,96 +562,104 @@ def chunk_tables(tables: List[Dict], chunk_size: int = 400) -> List[Chunk]:
                     "table_id": row["table_id"],
                     "entity": entity,
                     "fiscal_years": fiscal_years,
-                    "unit": unit,
                     "headers": row["headers"],
-                    "row_data": row_data,
+                    "row_data": row["row_data"],
                     "numeric_values": row["numeric_values"],
                 }
             ))
             chunk_id += 1
     return chunks
 
+
 # -------------------------------------------------------------------------
-# Metadata Enrichment
+# Metadata Enrichment (with Correct Evidence Creation)
 # -------------------------------------------------------------------------
 def enrich_chunks(chunks: List[Chunk]) -> List[Chunk]:
     """Add extracted entities, metrics, fiscal years to chunk metadata."""
     for chunk in chunks:
         text = chunk.text
-        # Extract metadata
         entities = extract_entities(text)
         metrics = extract_metrics(text)
         fiscal_years = extract_fiscal_years(text)
-        # Update metadata
+
         chunk.metadata["entities"] = entities
         chunk.metadata["metrics"] = metrics
         chunk.metadata["fiscal_years"] = fiscal_years
-        # Build evidence records from text (for numeric values)
-        # For table chunks, we already have structured evidence; for text, try to extract.
+
         if chunk.source_type == "text":
             evidence = []
-            # Attempt to extract entity + metric + value
-            # Very simplistic: find number, entity, metric in same sentence.
-            # For production, a more robust extractor is needed.
             sentences = re.split(r"[.!?]", text)
             for sent in sentences:
                 if len(sent.strip()) < 10:
                     continue
-                val = extract_numeric_value(sent)
+                val, unit, is_pct = parse_financial_value(sent)
                 if val is not None:
                     ents = extract_entities(sent)
                     metrics2 = extract_metrics(sent)
                     fys = extract_fiscal_years(sent)
-                    for ent in ents:
-                        for met in metrics2:
-                            for fy in fys:
-                                evidence.append(EvidenceRecord(
-                                    entity=ent,
-                                    metric=met,
-                                    fiscal_year=fy,
-                                    value=val,
-                                    unit=None,  # unknown
-                                    page=chunk.page,
-                                    chunk_id=chunk.chunk_id,
-                                    source_text=sent.strip(),
-                                    source_type="text"
-                                ))
+                    # Only create evidence if we have at least one entity and metric
+                    if ents and metrics2:
+                        for ent in ents:
+                            for met in metrics2:
+                                for fy in (fys or [None]):
+                                    evidence.append(EvidenceRecord(
+                                        entity=ent,
+                                        metric=met,
+                                        fiscal_year=fy,
+                                        value=val,
+                                        unit=unit,
+                                        page=chunk.page,
+                                        chunk_id=chunk.chunk_id,
+                                        source_text=sent.strip(),
+                                        source_type="text",
+                                        is_percentage=is_pct,
+                                    ))
             chunk.evidence_records = evidence
-        else:
-            # Table chunks: convert metadata to evidence records
+
+        else:  # table chunks
             evidence = []
             meta = chunk.metadata
             entities = meta.get("entities", [])
             if meta.get("entity"):
                 entities.append(meta["entity"])
             entities = list(set(entities))
-            fiscal_years = meta.get("fiscal_years", [])
-            unit = meta.get("unit")
-            row_data = meta.get("row_data", {})
+
             numeric_vals = meta.get("numeric_values", [])
-            # For each numeric value, create evidence
-            for key, num, orig in numeric_vals:
-                # Determine metric: try to match key to known metrics
-                metric = None
-                metrics_list = extract_metrics(key)
-                if metrics_list:
-                    metric = metrics_list[0]
+            for nv in numeric_vals:
+                val = nv.get("value")
+                if val is None:
+                    continue
+                fy = nv.get("fiscal_year")
+                metric = nv.get("metric")
+                unit = nv.get("unit")
+                is_pct = nv.get("is_percentage", False)
+                source_text = nv.get("source_text", "")
+                # If metric is not set, try to infer from the column header
+                if not metric:
+                    # Check if we have a metric in metadata
+                    if meta.get("metrics"):
+                        metric = meta["metrics"][0] if meta["metrics"] else None
+                # If fiscal year is not set, use the first fiscal year from the table
+                if not fy and meta.get("fiscal_years"):
+                    fy = meta["fiscal_years"][0] if meta["fiscal_years"] else None
+
                 for ent in entities:
-                    for fy in fiscal_years:
-                        evidence.append(EvidenceRecord(
-                            entity=ent,
-                            metric=metric,
-                            fiscal_year=fy,
-                            value=num,
-                            unit=unit,
-                            page=chunk.page,
-                            chunk_id=chunk.chunk_id,
-                            source_text=orig,
-                            source_type="table"
-                        ))
-            # Also add row_data text for general QA
+                    evidence.append(EvidenceRecord(
+                        entity=ent,
+                        metric=metric,
+                        fiscal_year=fy,
+                        value=val,
+                        unit=unit,
+                        page=chunk.page,
+                        chunk_id=chunk.chunk_id,
+                        source_text=source_text,
+                        source_type="table",
+                        is_percentage=is_pct,
+                    ))
             chunk.evidence_records = evidence
+
     return chunks
+
 
 # -------------------------------------------------------------------------
 # Index Management
@@ -548,7 +671,7 @@ class IndexManager:
         self.index_dir = Path(config["index_dir"])
         self.index_dir.mkdir(parents=True, exist_ok=True)
         self.doc_hash = compute_sha256(pdf_path)
-        self.schema_version = "1.0"
+        self.schema_version = "2.0"  # bumped for new evidence model
         self.model_name = config["embedding_model"]
         self.dim = None
         self.cache_prefix = f"{self.doc_hash}_{self.model_name.replace('/','_')}_{self.schema_version}"
@@ -556,16 +679,19 @@ class IndexManager:
     def _cache_path(self, suffix: str) -> Path:
         return self.index_dir / f"{self.cache_prefix}_{suffix}"
 
-    def save(self, chunks: List[Chunk], index: faiss.Index, bm25: BM25Okapi):
-        """Save FAISS index, BM25 index, and chunks metadata."""
-        # Save FAISS
+    def save(self, chunks: List[Chunk], index: faiss.Index, bm25: BM25Okapi, tokenized_corpus: List[List[str]]):
+        """Save FAISS index, BM25 index, tokenized corpus, and chunks metadata."""
         faiss_path = self._cache_path("faiss.index")
         faiss.write_index(index, str(faiss_path))
-        # Save BM25 (pickle)
+
         bm25_path = self._cache_path("bm25.pkl")
         with open(bm25_path, "wb") as f:
             pickle.dump(bm25, f)
-        # Save chunks and metadata
+
+        corpus_path = self._cache_path("corpus.pkl")
+        with open(corpus_path, "wb") as f:
+            pickle.dump(tokenized_corpus, f)
+
         meta = {
             "chunks": [
                 {
@@ -590,29 +716,36 @@ class IndexManager:
             json.dump(meta, f, indent=2)
         logger.info(f"Saved index to {self.index_dir}")
 
-    def load(self) -> Tuple[List[Chunk], faiss.Index, BM25Okapi]:
+    def load(self) -> Tuple[List[Chunk], faiss.Index, BM25Okapi, List[List[str]]]:
         """Load index and metadata; verify compatibility."""
         meta_path = self._cache_path("meta.json")
         if not meta_path.exists():
-            return None, None, None
+            return None, None, None, None
+
         with open(meta_path, "r") as f:
             meta = json.load(f)
-        # Verify compatibility
+
         if (meta.get("doc_hash") != self.doc_hash or
             meta.get("model_name") != self.model_name or
             meta.get("schema_version") != self.schema_version):
             logger.warning("Index mismatch or outdated. Rebuilding.")
-            return None, None, None
-        # Load FAISS
+            return None, None, None, None
+
         faiss_path = self._cache_path("faiss.index")
         if not faiss_path.exists():
-            return None, None, None
+            return None, None, None, None
         index = faiss.read_index(str(faiss_path))
-        # Load BM25
+
         bm25_path = self._cache_path("bm25.pkl")
         with open(bm25_path, "rb") as f:
             bm25 = pickle.load(f)
-        # Reconstruct chunks
+
+        corpus_path = self._cache_path("corpus.pkl")
+        tokenized_corpus = []
+        if corpus_path.exists():
+            with open(corpus_path, "rb") as f:
+                tokenized_corpus = pickle.load(f)
+
         chunks = []
         for cdata in meta["chunks"]:
             evidence = [EvidenceRecord(**e) for e in cdata.get("evidence_records", [])]
@@ -626,9 +759,11 @@ class IndexManager:
                 evidence_records=evidence,
             )
             chunks.append(chunk)
+
         self.dim = meta.get("dim", index.d)
         logger.info(f"Loaded index from {self.index_dir} ({len(chunks)} chunks)")
-        return chunks, index, bm25
+        return chunks, index, bm25, tokenized_corpus
+
 
 # -------------------------------------------------------------------------
 # Embedding and Retrieval
@@ -649,7 +784,6 @@ class Retriever:
                 logger.warning(f"Reranker not available: {e}")
 
     def encode(self, texts: List[str], batch_size: int = 32) -> np.ndarray:
-        """Encode texts to normalized embeddings."""
         embeddings = self.embedding_model.encode(
             texts,
             batch_size=batch_size,
@@ -666,7 +800,6 @@ class Retriever:
     def dense_retrieve(self, query: str, index: faiss.Index, chunks: List[Chunk], top_k: int) -> List[Tuple[int, float]]:
         q_emb = self.encode([query])
         scores, indices = index.search(q_emb, top_k)
-        # indices is (1, top_k)
         results = [(int(idx), float(scores[0][i])) for i, idx in enumerate(indices[0]) if idx != -1]
         return results
 
@@ -678,7 +811,6 @@ class Retriever:
         return results
 
     def rrf(self, dense_results: List[Tuple[int, float]], bm25_results: List[Tuple[int, float]], k: int = 60) -> List[Tuple[int, float]]:
-        """Reciprocal Rank Fusion."""
         scores = defaultdict(float)
         for rank, (idx, _) in enumerate(dense_results, start=1):
             scores[idx] += 1.0 / (k + rank)
@@ -688,22 +820,19 @@ class Retriever:
         return [(idx, score) for idx, score in sorted_items]
 
     def rerank(self, query: str, chunk_texts: List[str], chunk_ids: List[int]) -> List[Tuple[int, float]]:
-        """Rerank using CrossEncoder."""
         if self.reranker is None:
             return [(cid, 0.0) for cid in chunk_ids]
         pairs = [(query, text) for text in chunk_texts]
         scores = self.reranker.predict(pairs)
-        # Sort by score descending
         sorted_pairs = sorted(zip(chunk_ids, scores), key=lambda x: x[1], reverse=True)
         return sorted_pairs
+
 
 # -------------------------------------------------------------------------
 # Query Classification
 # -------------------------------------------------------------------------
 def classify_query(query: str) -> str:
-    """Determine query type based on keywords."""
     q_lower = query.lower()
-    # Numeric / threshold
     if re.search(r"\b(exceeding|greater than|above|more than|at least|below|less than|at most)\b", q_lower):
         return "THRESHOLD"
     if re.search(r"\b(compare|vs|versus|compared to)\b", q_lower):
@@ -713,41 +842,56 @@ def classify_query(query: str) -> str:
     if re.search(r"\b(sum|total|average|mean|maximum|minimum|aggregate)\b", q_lower):
         return "AGGREGATION"
     if re.search(r"\b(double.?digit growth)\b", q_lower):
-        return "THRESHOLD"  # handled as threshold with growth>=10%
-    # If contains numbers, likely numeric
+        return "THRESHOLD"
     if re.search(r"\b\d+\b", q_lower):
         return "NUMERIC"
-    # Check for specific financial metrics
     metrics = extract_metrics(q_lower)
     if metrics:
         return "NUMERIC"
-    # Default to factual
     return "FACTUAL"
+
 
 # -------------------------------------------------------------------------
 # Reasoning Engines
 # -------------------------------------------------------------------------
 def extract_structured_evidence_from_chunks(chunks: List[Chunk]) -> List[EvidenceRecord]:
-    """Collect all evidence records from chunks."""
     evidence = []
     for chunk in chunks:
         evidence.extend(chunk.evidence_records)
     return evidence
 
+
 def handle_threshold_query(query: str, chunks: List[Chunk]) -> Tuple[Optional[str], List[Dict], List[EvidenceRecord]]:
-    """
-    Process threshold query and return answer text, citations, and evidence used.
-    """
     parsed = parse_threshold(query)
     if not parsed:
         return None, [], []
+
     operator = parsed["operator"]
     threshold = parsed["threshold"]
     unit = parsed["unit"]
     fiscal_year = parsed["fiscal_year"]
     metric = parsed["metric"]
+
     evidence = extract_structured_evidence_from_chunks(chunks)
-    # Filter evidence
+
+    # Handle double-digit growth special case
+    if "double-digit growth" in query.lower() or "double digit growth" in query.lower():
+        # Filter for growth metrics and percentage values >= 10%
+        filtered = []
+        for rec in evidence:
+            if rec.metric == "growth" and rec.is_percentage and rec.value is not None:
+                if rec.value >= 10.0:
+                    filtered.append(rec)
+        if not filtered:
+            return "No entities with double-digit growth found.", [], []
+        lines = []
+        for rec in filtered:
+            lines.append(f"{rec.entity}: {rec.value}% (FY{rec.fiscal_year})")
+        answer = "\n".join(lines)
+        citations = [{"page": rec.page, "chunk_id": rec.chunk_id, "source_type": rec.source_type} for rec in filtered]
+        return answer, citations, filtered
+
+    # Standard threshold
     filtered = []
     for rec in evidence:
         if rec.value is None:
@@ -758,7 +902,7 @@ def handle_threshold_query(query: str, chunks: List[Chunk]) -> Tuple[Optional[st
             continue
         if unit and rec.unit != unit:
             continue
-        # Apply operator
+
         if operator == ">":
             if rec.value > threshold:
                 filtered.append(rec)
@@ -771,30 +915,34 @@ def handle_threshold_query(query: str, chunks: List[Chunk]) -> Tuple[Optional[st
         elif operator == "<=":
             if rec.value <= threshold:
                 filtered.append(rec)
+
     if not filtered:
         return "No entities met the threshold.", [], []
-    # Format answer
+
     lines = []
     for rec in filtered:
-        lines.append(f"{rec.entity} ({rec.metric}): {rec.value} {rec.unit or ''} (FY{rec.fiscal_year})")
+        unit_str = f" {rec.unit}" if rec.unit else ""
+        fy_str = f" (FY{rec.fiscal_year})" if rec.fiscal_year else ""
+        lines.append(f"{rec.entity} ({rec.metric}): {rec.value}{unit_str}{fy_str}")
     answer = "\n".join(lines)
     citations = [{"page": rec.page, "chunk_id": rec.chunk_id, "source_type": rec.source_type} for rec in filtered]
     return answer, citations, filtered
 
+
 def handle_comparison_query(query: str, chunks: List[Chunk]) -> Tuple[Optional[str], List[Dict], List[EvidenceRecord]]:
-    """Compare two fiscal years."""
     fiscal_years = extract_fiscal_years(query)
     if len(fiscal_years) < 2:
         return None, [], []
+
     fy1, fy2 = fiscal_years[:2]
     evidence = extract_structured_evidence_from_chunks(chunks)
-    # Group by entity and metric
+
     grouped = defaultdict(lambda: {})
     for rec in evidence:
         if rec.entity and rec.metric and rec.fiscal_year in (fy1, fy2):
             key = (rec.entity, rec.metric)
             grouped[key][rec.fiscal_year] = rec.value
-    # Build comparison
+
     lines = []
     used_evidence = []
     for (entity, metric), values in grouped.items():
@@ -802,47 +950,56 @@ def handle_comparison_query(query: str, chunks: List[Chunk]) -> Tuple[Optional[s
         val2 = values.get(fy2)
         if val1 is not None and val2 is not None:
             diff = val1 - val2
-            pct = (diff / val2 * 100) if val2 != 0 else None
-            lines.append(f"{entity} {metric}: {fy1} = {val1}, {fy2} = {val2}, change = {diff} ({pct:.1f}%)" if pct is not None else f"{entity} {metric}: {fy1} = {val1}, {fy2} = {val2}")
-            # Add evidence records for both years
+            if val2 != 0:
+                pct = (diff / val2) * 100
+                lines.append(f"{entity} {metric}: {fy1} = {val1}, {fy2} = {val2}, change = {diff} ({pct:.1f}%)")
+            else:
+                lines.append(f"{entity} {metric}: {fy1} = {val1}, {fy2} = {val2}, change = {diff}")
             used_evidence.extend([r for r in evidence if r.entity == entity and r.metric == metric and r.fiscal_year in (fy1, fy2)])
+
     if not lines:
         return None, [], []
+
     answer = "\n".join(lines)
     citations = [{"page": r.page, "chunk_id": r.chunk_id} for r in used_evidence]
     return answer, citations, used_evidence
 
+
 def handle_ranking_query(query: str, chunks: List[Chunk]) -> Tuple[Optional[str], List[Dict], List[EvidenceRecord]]:
-    """Rank entities by a metric."""
-    # Determine ascending or descending
-    if "lowest" in query.lower() or "smallest" in query.lower():
-        ascending = True
-    else:
-        ascending = False
+    ascending = "lowest" in query.lower() or "smallest" in query.lower()
     metric = extract_metrics(query)
     metric = metric[0] if metric else None
     fiscal_years = extract_fiscal_years(query)
     fy = fiscal_years[0] if fiscal_years else None
+
     evidence = extract_structured_evidence_from_chunks(chunks)
-    # Filter by metric and fiscal year
     filtered = [r for r in evidence if (not metric or r.metric == metric) and (not fy or r.fiscal_year == fy)]
+
     if not filtered:
         return None, [], []
-    # Deduplicate by entity and metric and keep max value if multiple
+
+    # Deduplicate by entity and metric, keep max value if multiple
     best = {}
     for r in filtered:
         if r.entity and r.metric:
             key = (r.entity, r.metric)
             if key not in best or r.value > best[key].value:
                 best[key] = r
+
     sorted_items = sorted(best.values(), key=lambda x: x.value, reverse=not ascending)
-    answer = "\n".join([f"{r.entity} ({r.metric}): {r.value} {r.unit or ''}" for r in sorted_items])
+
+    lines = []
+    for r in sorted_items:
+        unit_str = f" {r.unit}" if r.unit else ""
+        fy_str = f" (FY{r.fiscal_year})" if r.fiscal_year else ""
+        lines.append(f"{r.entity} ({r.metric}): {r.value}{unit_str}{fy_str}")
+
+    answer = "\n".join(lines)
     citations = [{"page": r.page, "chunk_id": r.chunk_id} for r in sorted_items]
     return answer, citations, sorted_items
 
+
 def handle_aggregation_query(query: str, chunks: List[Chunk]) -> Tuple[Optional[str], List[Dict], List[EvidenceRecord]]:
-    """Compute sum, average, max, min."""
-    # Detect operation
     q_lower = query.lower()
     if "sum" in q_lower or "total" in q_lower:
         op = "sum"
@@ -854,18 +1011,22 @@ def handle_aggregation_query(query: str, chunks: List[Chunk]) -> Tuple[Optional[
         op = "min"
     else:
         return None, [], []
-    # Extract metric and fiscal year
+
     metric = extract_metrics(query)
     metric = metric[0] if metric else None
     fy = extract_fiscal_years(query)
     fy = fy[0] if fy else None
+
     evidence = extract_structured_evidence_from_chunks(chunks)
     filtered = [r for r in evidence if (not metric or r.metric == metric) and (not fy or r.fiscal_year == fy)]
+
     if not filtered:
         return None, [], []
+
     values = [r.value for r in filtered if r.value is not None]
     if not values:
         return None, [], []
+
     if op == "sum":
         result = sum(values)
         label = "Sum"
@@ -880,17 +1041,18 @@ def handle_aggregation_query(query: str, chunks: List[Chunk]) -> Tuple[Optional[
         label = "Minimum"
     else:
         return None, [], []
+
     unit = filtered[0].unit or ""
     answer = f"{label}: {result} {unit}".strip()
     citations = [{"page": r.page, "chunk_id": r.chunk_id} for r in filtered]
     return answer, citations, filtered
 
+
 # -------------------------------------------------------------------------
 # LLM Generation
 # -------------------------------------------------------------------------
 def build_prompt(query: str, context: str) -> str:
-    """Build the prompt for FLAN-T5."""
-    prompt = f"""Answer the question using ONLY the context below.
+    return f"""Answer the question using ONLY the context below.
 The context is from an annual report.
 
 Context:
@@ -902,67 +1064,66 @@ If the context does not contain enough information to answer, say exactly: "I do
 Provide a concise, factual answer. Cite the page number if available.
 
 Answer:"""
-    return prompt
+
 
 def generate_answer(query: str, chunks: List[Chunk], config: Dict[str, Any]) -> Tuple[str, List[Dict]]:
-    """Generate answer using FLAN-T5."""
-    # Prepare context from chunks (limit tokens)
+    # Prepare context
     context_parts = []
     total_len = 0
     for chunk in chunks:
         text = chunk.text
-        # Rough token estimation: 1 token ~ 4 chars
         est_len = len(text) // 4
         if total_len + est_len > config["max_context_tokens"]:
             break
         context_parts.append(text)
         total_len += est_len
+
     context = "\n\n".join(context_parts)
     if not context:
         return "I don't know from the document.", []
 
     prompt = build_prompt(query, context)
-    # Load model
     model_name = config["generation_model"]
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model.to(device)
-    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=config["max_context_tokens"] + 200)
-    inputs = {k: v.to(device) for k, v in inputs.items()}
-    outputs = model.generate(
-        **inputs,
-        max_new_tokens=config["max_answer_tokens"],
-        do_sample=False,
-    )
-    answer = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
-    # Check for refusal
+
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model.to(device)
+
+        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=config["max_context_tokens"] + 200)
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=config["max_answer_tokens"],
+            do_sample=False,
+        )
+        answer = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
+    except Exception as e:
+        logger.error(f"LLM generation failed: {e}")
+        return "I don't know from the document.", []
+
     if "don't know" in answer.lower() or "not enough information" in answer.lower():
         return "I don't know from the document.", []
-    # Extract citations (pages) from answer if possible
+
+    # Extract citations
     citations = []
-    # Simple regex to find page numbers
     page_matches = re.findall(r"Page\s*(\d+)", answer, re.IGNORECASE)
     for p in page_matches:
         citations.append({"page": int(p)})
-    if not citations:
-        # Use chunk pages as fallback
-        for chunk in chunks:
-            if chunk.text in context:
-                citations.append({"page": chunk.page, "chunk_id": chunk.chunk_id})
-                break
+    if not citations and chunks:
+        # Use the first chunk's page as fallback
+        citations.append({"page": chunks[0].page, "chunk_id": chunks[0].chunk_id})
+
     return answer, citations
+
 
 # -------------------------------------------------------------------------
 # Grounding Validation
 # -------------------------------------------------------------------------
 def validate_answer(answer: str, chunks: List[Chunk]) -> Tuple[bool, Dict[str, bool], str]:
-    """
-    Validate answer against evidence records.
-    Returns (grounded, validation_dict, refusal_reason).
-    """
-    # Extract all evidence records
     evidence = extract_structured_evidence_from_chunks(chunks)
+
     # Extract numeric claims from answer
     numbers = re.findall(r"(\d{1,3}(?:,\d{3})*(?:\.\d+)?)", answer)
     claims = []
@@ -970,27 +1131,26 @@ def validate_answer(answer: str, chunks: List[Chunk]) -> Tuple[bool, Dict[str, b
         val = safe_float(num_str)
         if val is not None:
             claims.append(val)
+
     if not claims:
-        # No numeric claims; check for entity mention
+        # No numeric claims; check entity mentions
         entities_in_answer = extract_entities(answer)
         if entities_in_answer:
-            # Check if any entity appears in evidence
             entity_found = any(any(e in ent for ent in entities_in_answer) for e in evidence if e.entity)
             if not entity_found:
                 return False, {"entity_grounding": False}, "Entity not grounded"
             return True, {"entity_grounding": True}, ""
-        return True, {}, ""  # No claims to validate
-    # Check each numeric value against evidence records (entity, metric, fiscal year)
+        return True, {}, ""
+
+    # Validate each numeric claim
     validation = {"numeric_grounding": False, "entity_grounding": False, "metric_grounding": False, "fiscal_year_grounding": False}
-    # For each claim, find matching evidence
     grounded_claims = 0
+
     for claim in claims:
-        # Find evidence with same value (allow tolerance)
         for rec in evidence:
             if rec.value is None:
                 continue
             if abs(rec.value - claim) < 0.01:
-                # Check entity
                 if rec.entity and rec.entity.lower() in answer.lower():
                     validation["entity_grounding"] = True
                 if rec.metric and rec.metric.replace("_", " ") in answer.lower():
@@ -999,17 +1159,27 @@ def validate_answer(answer: str, chunks: List[Chunk]) -> Tuple[bool, Dict[str, b
                     validation["fiscal_year_grounding"] = True
                 grounded_claims += 1
                 break
-    if grounded_claims == len(claims):
+
+    if grounded_claims == len(claims) and claims:
         validation["numeric_grounding"] = True
-        return True, validation, ""
+        # Check if all required dimensions are grounded
+        all_grounded = all([
+            validation["entity_grounding"] or not any(e.entity for e in evidence),
+            validation["metric_grounding"] or not any(e.metric for e in evidence),
+            validation["fiscal_year_grounding"] or not any(e.fiscal_year for e in evidence),
+        ])
+        if all_grounded:
+            return True, validation, ""
+        else:
+            return False, validation, "Some dimensions not grounded"
     else:
         return False, validation, "Numeric claim not fully grounded"
+
 
 # -------------------------------------------------------------------------
 # Main Pipeline
 # -------------------------------------------------------------------------
 def run_pipeline(pdf_path: str, query: str, config: Dict[str, Any], rebuild: bool = False) -> QueryResult:
-    """Execute the full RAG pipeline for a single query."""
     logger.info(f"Processing query: {query}")
 
     # 1. Extract PDF
@@ -1027,40 +1197,37 @@ def run_pipeline(pdf_path: str, query: str, config: Dict[str, Any], rebuild: boo
 
     # 4. Build/load index
     index_manager = IndexManager(config, pdf_path)
+
     if rebuild:
         logger.info("Rebuilding index per request")
-        chunks, index, bm25 = None, None, None
+        chunks, index, bm25, tokenized_corpus = None, None, None, None
     else:
-        chunks, index, bm25 = index_manager.load()
+        chunks, index, bm25, tokenized_corpus = index_manager.load()
 
     if chunks is None:
-        # Build from scratch
         logger.info("Building indices from chunks")
-        # Create corpus for BM25 (tokenized)
-        tokenized_corpus = [normalize_text(c.text).split() for c in all_chunks]
-        bm25 = BM25Okapi(tokenized_corpus)
-        # Create embeddings
         retriever = Retriever(config)
         texts = [c.text for c in all_chunks]
         embeddings = retriever.encode(texts)
         index = retriever.build_faiss_index(embeddings)
-        # Store embeddings in chunks
+
+        tokenized_corpus = [normalize_text(c.text).split() for c in all_chunks]
+        bm25 = BM25Okapi(tokenized_corpus)
+
         for i, emb in enumerate(embeddings):
             all_chunks[i].embedding = emb
-        # Save index
-        index_manager.save(all_chunks, index, bm25)
+
+        index_manager.save(all_chunks, index, bm25, tokenized_corpus)
         chunks = all_chunks
     else:
         logger.info("Loaded existing index")
-        # Ensure embedding model is loaded
         retriever = Retriever(config)
 
     # 5. Retrieve
-    retriever = Retriever(config)
     dense_results = retriever.dense_retrieve(query, index, chunks, config["dense_top_k"])
     bm25_results = retriever.bm25_retrieve(query, bm25, tokenized_corpus, config["bm25_top_k"])
     rrf_results = retriever.rrf(dense_results, bm25_results, config["rrf_k"])
-    # Get candidate chunk ids
+
     candidate_ids = [idx for idx, _ in rrf_results[:config["rerank_top_k"]]]
     candidate_chunks = [chunks[idx] for idx in candidate_ids]
 
@@ -1091,14 +1258,14 @@ def run_pipeline(pdf_path: str, query: str, config: Dict[str, Any], rebuild: boo
     elif query_type == "AGGREGATION":
         answer, citations, evidence_used = handle_aggregation_query(query, final_chunks)
     else:
-        # Use LLM for FACTUAL or NUMERIC (if no specific engine)
+        # Use LLM for FACTUAL or NUMERIC
         answer, citations = generate_answer(query, final_chunks, config)
-        # For numeric queries, also try structured if LLM fails
-        if query_type in ("NUMERIC",) and ("don't know" in answer.lower()):
-            # Fallback to threshold or extraction
-            parsed = parse_threshold(query)
-            if parsed:
-                answer, citations, evidence_used = handle_threshold_query(query, final_chunks)
+        # If LLM failed or refused, try structured fallbacks
+        if "don't know" in answer.lower():
+            # Try threshold
+            ans_t, cit_t, ev_t = handle_threshold_query(query, final_chunks)
+            if ans_t and "No entities" not in ans_t:
+                answer, citations, evidence_used = ans_t, cit_t, ev_t
             else:
                 # Try ranking
                 ans_r, cit_r, ev_r = handle_ranking_query(query, final_chunks)
@@ -1110,11 +1277,11 @@ def run_pipeline(pdf_path: str, query: str, config: Dict[str, Any], rebuild: boo
                     if ans_a:
                         answer, citations, evidence_used = ans_a, cit_a, ev_a
 
-    # 9. If answer is None, refuse
-    if answer is None:
+    # 9. If answer is None or refusal, refuse
+    if answer is None or "don't know" in answer.lower():
         answer = "I don't know from the document."
         grounded = False
-        refusal_reason = "No reasoning engine produced an answer."
+        refusal_reason = refusal_reason or "No reasoning engine produced an answer."
     else:
         # 10. Grounding validation
         grounded, validation, refusal_reason = validate_answer(answer, final_chunks)
@@ -1122,7 +1289,7 @@ def run_pipeline(pdf_path: str, query: str, config: Dict[str, Any], rebuild: boo
             answer = "I don't know from the document."
             refusal_reason = refusal_reason or "Answer not grounded in evidence."
 
-    # 11. Confidence (simple heuristic based on retrieval scores)
+    # 11. Confidence
     if grounded:
         confidence = 0.8 + 0.2 * (len(final_chunks) / config["final_top_k"])
         confidence = min(confidence, 1.0)
@@ -1147,6 +1314,7 @@ def run_pipeline(pdf_path: str, query: str, config: Dict[str, Any], rebuild: boo
     )
     return result
 
+
 # -------------------------------------------------------------------------
 # CLI
 # -------------------------------------------------------------------------
@@ -1162,7 +1330,6 @@ def main():
 
     config = load_config(args.config)
 
-    # Load queries
     queries = []
     if args.query:
         queries = [args.query]
@@ -1170,7 +1337,6 @@ def main():
         with open(args.queries, "r") as f:
             queries = json.load(f)
     else:
-        # Interactive
         print("Enter your query (type 'exit' to quit):")
         while True:
             q = input("> ")
@@ -1190,6 +1356,7 @@ def main():
         logger.info(f"Results written to {args.output}")
     else:
         print(json.dumps(results, indent=2))
+
 
 if __name__ == "__main__":
     main()

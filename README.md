@@ -2,195 +2,92 @@
 
 An evaluation-oriented Retrieval-Augmented Generation (RAG) pipeline for answering questions from the **Titan Company Limited Integrated Annual Report 2025–26**.
 
-The project is intentionally implemented in Python with open-source components and is designed to demonstrate the core engineering concerns of document RAG: document extraction, chunking, semantic retrieval, lexical reranking, grounded generation, evidence metadata, and reproducible evaluation.
+The project demonstrates the core engineering concerns of document question answering:
 
-> **Important:** This project should be considered an evaluation/portfolio RAG implementation, not a fully production-ready enterprise RAG platform. Production deployment would require additional observability, security, testing, model governance, latency/cost controls, and stronger grounding evaluation.
+- PDF text and table extraction
+- Structure-aware chunking with source metadata
+- Semantic retrieval with Sentence Transformers and FAISS
+- Lexical reranking with BM25
+- Evidence-constrained generation with FLAN-T5
+- Lightweight validation of generated numerical claims
+- Reproducible evaluation over a fixed question set
+- Explicit refusal when the document does not contain enough evidence
 
----
+> **Project status:** This is an evaluation and portfolio implementation, not a production-ready enterprise RAG platform. Production use would require stronger observability, security, testing, model governance, latency and cost controls, and claim-level grounding evaluation.
 
-## 1. Problem Statement
+## Problem statement
 
-The system answers a fixed evaluation set of questions against the Titan Annual Report 2025–26.
+The pipeline answers a fixed set of questions about Titan's FY2025–26 annual report. The evaluation set covers several common RAG challenges:
 
-The evaluation set deliberately contains different RAG problem types:
+| Question type | Example capability |
+| --- | --- |
+| Semantic and causal | Explain what drove Jewellery Division growth |
+| Financial tables | Extract KPIs for FY2025–26 and FY2024–25 |
+| Numerical filtering | Identify businesses with double-digit growth |
+| Threshold comparisons | Find businesses above INR 5,000 crore |
+| Cross-section reasoning | Combine evidence from multiple report sections |
+| Strategy retrieval | Find initiatives and programmes |
+| Out-of-document handling | Refuse unsupported FY2027 questions |
 
-- Semantic/causal questions
-- Financial table questions
-- Numerical filtering questions
-- Threshold/comparison questions
-- Cross-section questions
-- Business-performance questions
-- Out-of-document questions
-
-A key design objective is to **avoid hallucination when the annual report does not contain sufficient evidence**.
-
-For unsupported questions, the expected refusal is:
+When the report does not provide sufficient evidence, the expected response is:
 
 ```text
 I don't know from the document.
 ```
 
----
-
-## 2. Current Architecture
+## Architecture
 
 ```text
-                    Titan Annual Report PDF
-                              |
-                              v
-                    +--------------------+
-                    | PDF Extraction     |
-                    | pdfplumber          |
-                    | Text + Tables       |
-                    +---------+----------+
-                              |
-                              v
-                    +--------------------+
-                    | Text Cleaning      |
-                    | CID removal         |
-                    | Whitespace cleanup  |
-                    +---------+----------+
-                              |
-                              v
-                    +--------------------+
-                    | Structure-aware     |
-                    | Page / paragraph    |
-                    | chunking            |
-                    +---------+----------+
-                              |
-                              v
-                    +--------------------+
-                    | Sentence           |
-                    | Transformers       |
-                    | MiniLM embeddings  |
-                    +---------+----------+
-                              |
-                              v
-                    +--------------------+
-                    | FAISS              |
-                    | IndexFlatIP        |
-                    | cosine-style       |
-                    | similarity         |
-                    +---------+----------+
-                              |
-                     User / Evaluation
-                         Question
-                              |
-                              v
-                    +--------------------+
-                    | Dense Retrieval    |
-                    | top 15 candidates   |
-                    +---------+----------+
-                              |
-                              v
-                    +--------------------+
-                    | BM25 Lexical       |
-                    | Reranking          |
-                    | top 5              |
-                    +---------+----------+
-                              |
-                              v
-                    +--------------------+
-                    | Prompt Builder     |
-                    | Evidence + Query   |
-                    +---------+----------+
-                              |
-                              v
-                    +--------------------+
-                    | FLAN-T5-base       |
-                    | Open-source LLM     |
-                    +---------+----------+
-                              |
-                              v
-                    +--------------------+
-                    | Grounding          |
-                    | Number validation  |
-                    +---------+----------+
-                              |
-                              v
-                    +--------------------+
-                    | results.json       |
-                    | Answer + Evidence  |
-                    +--------------------+
-```
-
----
-
-## 3. Key Design Decisions
-
-### 3.1 Open-source models
-
-The current implementation uses:
-
-- Embeddings: `sentence-transformers/all-MiniLM-L6-v2`
-- Generation: `google/flan-t5-base`
-
-This keeps the project free from paid LLM API dependencies and makes local execution possible.
-
-The models are configurable through the pipeline configuration.
-
-### 3.2 Dense retrieval
-
-Embeddings are normalized and stored in:
-
-```text
-FAISS IndexFlatIP
-```
-
-Because normalized vectors are used, inner-product similarity behaves as cosine similarity.
-
-### 3.3 Two-stage retrieval
-
-The pipeline retrieves a larger candidate set first:
-
-```text
-Dense retrieval: top 15
+Titan annual report PDF
         |
         v
-BM25 lexical reranking
+PDF extraction with pdfplumber
         |
         v
-Final context: top 5
+Text cleaning and table conversion
+        |
+        v
+Structure-aware page and paragraph chunks
+        |
+        +--> Sentence Transformer embeddings
+        |          |
+        |          v
+        |     FAISS cosine-style index
+        |
+        +--> BM25 lexical index
+                   |
+                   v
+        Candidate fusion and reranking
+                   |
+                   v
+        Evidence context and question
+                   |
+                   v
+        FLAN-T5 grounded generation
+                   |
+                   v
+        Number validation and refusal logic
+                   |
+                   v
+        results.json with answers and evidence
 ```
 
-This is useful for annual reports because queries frequently contain exact entities, financial terms, fiscal years, percentages, and business names.
+## How retrieval works
 
-### 3.4 Grounding
+The pipeline uses a two-stage retrieval strategy:
 
-The generation prompt instructs the model to answer only from retrieved context.
+1. Embed the question with `sentence-transformers/all-MiniLM-L6-v2`.
+2. Retrieve the top 15 candidates from a normalized `FAISS IndexFlatIP` index.
+3. Remove duplicate page and text entries.
+4. Rerank the dense candidates with BM25 when `rank-bm25` is installed.
+5. Combine normalized scores using a 70% dense and 30% lexical weighting.
+6. Pass the top five chunks to the generation step.
 
-A lightweight validation layer additionally checks numerical claims in the generated answer against retrieved evidence.
+Dense retrieval helps with paraphrased questions, while BM25 improves matching for exact business names, financial terms, fiscal years, percentages, and values.
 
-This is a useful guardrail, but it is **not a complete factuality or entailment validator**.
+## Document processing
 
----
-
-## 4. Document Processing
-
-The PDF is processed page-by-page.
-
-Each page retains:
-
-```text
-page number
-text
-tables
-```
-
-Tables are converted into row-level chunks using:
-
-```text
-Header: Value | Header: Value | ...
-```
-
-Text is chunked using approximately:
-
-```text
-Chunk size:     400 words
-Chunk overlap:   80 words
-```
-
-Chunk metadata includes:
+The report is processed page by page. Each extracted chunk retains traceability metadata:
 
 ```json
 {
@@ -198,174 +95,140 @@ Chunk metadata includes:
   "page": 137,
   "source_type": "table_row",
   "table_id": "table_137_1",
-  "text": "..."
+  "text": "Revenue: INR ..."
 }
 ```
 
-This metadata makes retrieval results traceable back to the source PDF.
+Text chunks use approximately:
 
----
+| Setting | Default |
+| --- | ---: |
+| Text chunk size | 400 words |
+| Chunk overlap | 80 words |
+| Dense retrieval candidates | 15 |
+| Final context chunks | 5 |
 
-## 5. Retrieval Pipeline
-
-### Stage 1 — Dense Retrieval
-
-The query is embedded with the configured sentence-transformer model.
-
-FAISS returns the top 15 candidates.
-
-### Stage 2 — Deduplication
-
-Duplicate `(page, text)` entries are removed.
-
-### Stage 3 — BM25 Reranking
-
-The dense candidates are reranked using BM25 when `rank-bm25` is installed.
-
-The current combined score uses:
+Tables are represented as row-level chunks in the form:
 
 ```text
-70% dense similarity
-30% BM25 score
+Header: Value | Header: Value | ...
 ```
 
-The final five chunks are passed to the generation stage.
+This preserves useful financial values and source-page information, while the limitations below describe where table representation can be improved.
 
-### Why not use BM25 alone?
+## Generation and grounding
 
-Semantic retrieval helps with paraphrased questions:
-
-```text
-"What drove jewellery growth?"
-```
-
-versus:
-
-```text
-"factors contributing to growth of the Jewellery Division"
-```
-
-Lexical retrieval is particularly useful for exact terms such as:
-
-```text
-CaratLane
-FY2025-26
-PBT
-turnover
-5,000 crore
-```
-
-The combination provides a simple hybrid retrieval strategy without introducing a separate vector database or external service.
-
----
-
-## 6. Generation
-
-The current generator is:
+Generation uses:
 
 ```text
 google/flan-t5-base
 ```
 
-Generation is deterministic:
+The model is instructed to answer only from the retrieved context and to return the refusal phrase when the context is insufficient. Sampling is disabled for deterministic generation:
 
 ```text
 do_sample=False
 ```
 
-The prompt establishes a strict evidence boundary:
-
-```text
-Answer using ONLY the provided context.
-
-If the context does not contain enough information:
-I don't know from the document.
-```
-
-The model is not expected to use external knowledge.
-
----
-
-## 7. Grounding and Validation
-
-A lightweight post-generation validation step checks numeric claims.
-
-For example, if the model generates:
-
-```text
-Revenue was INR 12,500 crore.
-```
-
-the validator checks whether the numeric value appears in retrieved context.
-
-If a generated number is not found, the answer is rejected and replaced by:
+After generation, the validation layer extracts numerical claims and checks whether the values appear in the retrieved evidence. Answers containing unsupported numbers are rejected and replaced with:
 
 ```text
 I don't know from the document.
 ```
 
-### Current limitation
+This is a useful guardrail, but it is not a complete factuality validator. Numeric presence alone does not prove that a value belongs to the correct entity, year, unit, or calculation.
 
-This validation is intentionally simple.
-
-It does **not** yet prove that:
-
-- every qualitative claim is supported;
-- a number is associated with the correct company/division;
-- a number belongs to the correct fiscal year;
-- units are equivalent;
-- a calculation is correct;
-- two retrieved statements are logically consistent.
-
-A future production implementation should use structured numerical extraction and/or an entailment-based grounding evaluator.
-
----
-
-## 8. Evaluation Questions
-
-The evaluation set is stored separately in:
+## Project structure
 
 ```text
-queries.json
+Titan-RAG/
+├── rag_pipeline.py
+├── queries.json
+├── results.json
+├── requirements.txt
+├── README.md
+├── Titan AR 2026_0.pdf
+└── index/
+    ├── index_<fingerprint>.faiss
+    └── metadata_<fingerprint>.json
 ```
 
-This is preferable to hard-coding evaluation questions in Python because it separates:
+The main pipeline is intentionally kept in one Python file so that the hackathon implementation is easy to run and inspect. A production implementation should separate ingestion, retrieval, generation, validation, and evaluation into modules.
+
+## Requirements
+
+- Python 3.9 or newer
+- The Titan annual report PDF
+- Sufficient disk space for downloaded model weights and the generated FAISS index
+
+Install the Python dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+The current dependency set includes:
 
 ```text
-pipeline logic
+pdfplumber
+sentence-transformers
+faiss-cpu
+torch
+transformers
+numpy
+rank-bm25
+pytest
 ```
 
-from:
+## Running the pipeline
 
-```text
-evaluation data
+Run with the default PDF and evaluation questions:
+
+```bash
+python rag_pipeline.py
 ```
 
-The current evaluation set covers:
+Provide custom input and output paths:
 
-| Category | Example capability |
-|---|---|
-| Causal / semantic | Explain business growth |
-| Financial table | Extract FY2025-26 and FY2024-25 KPIs |
-| Numerical filtering | Identify double-digit growth |
-| Threshold | Identify businesses above INR 5,000 crore |
-| Cross-section | Combine information from multiple report sections |
-| Strategy | Retrieve initiatives/programmes |
-| Out-of-document | Refuse unsupported FY2027 questions |
-
-The evaluation questions should **not be modified** when comparing pipeline versions.
-
----
-
-## 9. Output Format
-
-The pipeline writes:
-
-```text
-results.json
+```bash
+python rag_pipeline.py \
+  --pdf "Titan AR 2026_0.pdf" \
+  --queries queries.json \
+  --output results.json
 ```
 
-Example:
+Force the retrieval index to be rebuilt:
+
+```bash
+python rag_pipeline.py --rebuild-index
+```
+
+Provide optional configuration through JSON:
+
+```bash
+python rag_pipeline.py --config config.json
+```
+
+## Configuration
+
+The main configuration values are:
+
+| Parameter | Default | Purpose |
+| --- | ---: | --- |
+| `chunk_size` | `400` | Text chunk size in words |
+| `chunk_overlap` | `80` | Overlap between text chunks |
+| `top_k_retrieval` | `15` | Number of dense candidates |
+| `top_k_final` | `5` | Number of evidence chunks used for generation |
+| `use_reranker` | `true` | Enable BM25 reranking |
+| `relevance_threshold` | `null` | Optional relevance cutoff |
+| `max_prompt_tokens` | `512` | Intended prompt budget |
+| `seed` | `42` | Reserved deterministic seed |
+| `embedding_model` | MiniLM-L6-v2 | Sentence embedding model |
+| `generation_model` | FLAN-T5-base | Text generation model |
+
+## Output format
+
+The pipeline writes structured results to `results.json`:
 
 ```json
 [
@@ -386,436 +249,108 @@ Example:
 ]
 ```
 
-The evidence metadata enables retrieval debugging and auditability.
+The evidence metadata makes it possible to audit answers, debug retrieval, and compare pipeline versions.
 
----
+## Evaluation principles
 
-## 10. Project Structure
+Keep `queries.json` unchanged when comparing pipeline versions. Separating evaluation questions from pipeline code helps ensure that improvements are measured against the same test set.
 
-```text
-Titan-RAG/
-│
-├── rag_pipeline.py
-├── queries.json
-├── results.json
-├── requirements.txt
-├── README.md
-│
-├── Titan AR 2026_0.pdf
-│
-└── index/
-    ├── index_<fingerprint>.faiss
-    └── metadata_<fingerprint>.json
-```
+The current output format is useful for manual inspection. A fuller evaluation harness should add:
 
-The current implementation keeps the main pipeline in one Python file intentionally to make the hackathon submission easy to run.
-
-For a larger production system, ingestion, retrieval, generation, validation, and evaluation should be separated into modules.
-
----
-
-## 11. Installation
-
-### Requirements
-
-Python 3.9+ is recommended.
-
-Install dependencies:
-
-```bash
-pip install -r requirements.txt
-```
-
-Current dependencies include:
-
-```text
-pdfplumber
-sentence-transformers
-faiss-cpu
-torch
-transformers
-numpy
-rank-bm25
-pytest
-```
-
----
-
-## 12. Running the Pipeline
-
-Run using the default PDF and evaluation questions:
-
-```bash
-python rag_pipeline.py
-```
-
-Specify custom inputs:
-
-```bash
-python rag_pipeline.py \
-    --pdf "Titan AR 2026_0.pdf" \
-    --queries queries.json \
-    --output results.json
-```
-
-Force an index rebuild:
-
-```bash
-python rag_pipeline.py --rebuild-index
-```
-
-Optional configuration can be supplied through JSON:
-
-```bash
-python rag_pipeline.py --config config.json
-```
-
----
-
-## 13. Configuration
-
-The current defaults are approximately:
-
-| Parameter | Default | Purpose |
-|---|---:|---|
-| `chunk_size` | 400 | Text chunk size in words |
-| `chunk_overlap` | 80 | Chunk overlap |
-| `top_k_retrieval` | 15 | Dense retrieval candidates |
-| `top_k_final` | 5 | Final context chunks |
-| `use_reranker` | true | Enable BM25 reranking |
-| `relevance_threshold` | null | Disabled in favor of validation |
-| `max_prompt_tokens` | 512 | Intended prompt budget |
-| `seed` | 42 | Reserved deterministic seed setting |
-| `embedding_model` | MiniLM-L6-v2 | Embedding model |
-| `generation_model` | FLAN-T5-base | Generation model |
-
----
-
-# 14. Important Known Limitations
-
-The current implementation is substantially stronger than a basic single-stage RAG pipeline, but there are still important limitations.
-
-## 14.1 Document fingerprint is not a full-file hash
-
-The current fingerprint samples extracted content from the first five PDF pages.
-
-That means a change later in the PDF could theoretically go undetected.
-
-### Recommended improvement
-
-Use:
-
-```text
-SHA-256(full PDF bytes)
-+
-embedding model
-+
-chunk configuration
-+
-extraction version
-```
-
----
-
-## 14.2 Paragraph detection is partially defeated by text cleaning
-
-The cleaning step normalizes whitespace before chunking.
-
-Because newline structure is flattened, the intended paragraph-based splitting can become less effective.
-
-### Recommended improvement
-
-Preserve structural newlines during extraction and clean only after identifying blocks.
-
----
-
-## 14.3 Table representation can be improved
-
-Row-level table chunks are useful, but they can lose:
-
-- table title
-- section title
-- units
-- multi-row headers
-- fiscal-year relationships
-- neighbouring explanatory text
-
-### Recommended improvement
-
-Represent a table as:
-
-```text
-TABLE
-Title: ...
-Section: ...
-Page: ...
-
-Columns:
-Metric | FY2024-25 | FY2025-26
-
-Row:
-Revenue | ... | ...
-```
-
-This is particularly important for financial questions.
-
----
-
-## 14.4 BM25 is applied only after dense retrieval
-
-The current BM25 stage reranks the dense top-15 candidates.
-
-Therefore:
-
-```text
-If dense retrieval misses the correct chunk,
-BM25 cannot recover it.
-```
-
-A stronger hybrid retriever would independently retrieve candidates using both:
-
-```text
-Dense top-N
-+
-BM25 top-N
-```
-
-and merge/rerank the union.
-
----
-
-## 14.5 BM25 scoring normalization is query-dependent
-
-The dense and BM25 scores are normalized over the current candidate set.
-
-Consequently, the combined score is relative to the retrieved candidates rather than globally calibrated.
-
-A stronger implementation could use reciprocal rank fusion (RRF), which avoids directly comparing incompatible score scales.
-
----
-
-## 14.6 Numerical reasoning is not yet explicit
-
-Questions such as:
-
-```text
-Which businesses exceeded INR 5,000 crore?
-```
-
-require:
-
-```text
-retrieve
-→ extract entities and numbers
-→ normalize units
-→ compare
-→ filter
-```
-
-Semantic retrieval + generation alone does not guarantee this behavior.
-
-A stronger implementation should add a numerical reasoning/extraction layer.
-
----
-
-## 14.7 Grounding validation is only numeric
-
-The validator primarily checks whether numbers generated by the LLM occur in the retrieved context.
-
-It does not perform full claim-level entailment.
-
-Therefore an answer can theoretically contain a correct number attached to the wrong entity or year.
-
----
-
-## 14.8 Prompt truncation should use the actual tokenizer
-
-The pipeline has a configured prompt-token limit, but robust context budgeting should use the selected generation tokenizer rather than a rough word/token approximation.
-
-A better implementation would:
-
-1. tokenize each evidence chunk;
-2. rank chunks;
-3. add chunks until the context budget is reached;
-4. always reserve space for instructions and the question.
-
----
-
-## 14.9 Model loading is inefficient
-
-The current generation function loads the tokenizer and model when generating an answer.
-
-For 11 questions, this creates unnecessary repeated model initialization.
-
-### Recommended improvement
-
-Load the model once:
-
-```text
-Pipeline startup
-      ↓
-Load embedding model
-Load generation model
-      ↓
-Process all questions
-```
-
-This substantially improves evaluation runtime.
-
----
-
-## 14.10 Reproducibility can be stronger
-
-A `seed` configuration exists, but deterministic reproducibility should explicitly set seeds for:
-
-```text
-Python
-NumPy
-PyTorch
-```
-
-and record:
-
-```text
-model versions
-library versions
-configuration
-document hash
-```
-
-in the evaluation output.
-
----
-
-## 14.11 `grounded=true` needs more precise semantics
-
-The current output uses:
-
-```json
-"grounded": true
-```
-
-for accepted answers.
-
-This should eventually distinguish:
-
-```text
-retrieval_supported
-answer_validated
-fully_grounded
-refused
-```
-
-because a simple numeric-presence check is not equivalent to complete factual grounding.
-
----
-
-## 14.12 Evaluation needs reference answers and retrieval metrics
-
-The current evaluation executes the questions and generates results, but the repository would benefit from an explicit evaluation harness measuring:
-
-### Retrieval
+### Retrieval metrics
 
 - Recall@K
 - Precision@K
-- MRR
+- Mean Reciprocal Rank (MRR)
 - nDCG
 
-### Generation
+### Generation metrics
 
 - Answer correctness
-- Faithfulness / groundedness
+- Faithfulness or groundedness
 - Completeness
 
-### Safety
+### Safety metrics
 
 - Out-of-document refusal accuracy
 - Unsupported-number rate
 - Unsupported-claim rate
 
-A baseline-vs-improved comparison would make the architectural improvements measurable.
+## Known limitations
 
----
+The current implementation is intentionally lightweight. The main limitations are:
 
-# 15. Recommended Next-Generation Architecture
+1. **The document fingerprint is partial.** It samples early PDF content rather than hashing the complete file.
+2. **Cleaning can remove structure.** Normalizing whitespace before chunking can weaken paragraph detection.
+3. **Table context is incomplete.** Row chunks may omit table titles, section names, units, multi-row headers, and nearby explanations.
+4. **BM25 cannot recover dense misses.** Lexical reranking currently runs only over dense candidates.
+5. **Score weighting is query-relative.** Dense and BM25 scores are normalized within the current candidate set.
+6. **Numerical reasoning is implicit.** Retrieval and generation do not guarantee correct unit normalization, filtering, or arithmetic.
+7. **Grounding validation is primarily numeric.** Qualitative claims and entity-year relationships are not fully checked.
+8. **Prompt budgeting is approximate.** A robust implementation should budget context using the selected model tokenizer.
+9. **Model loading can be inefficient.** The generation model should be loaded once and reused across questions.
+10. **Reproducibility metadata is incomplete.** Results should record full document hashes, model versions, library versions, and configuration.
+11. **`grounded` is a coarse status.** It should eventually distinguish retrieval support, answer validation, full grounding, and refusal.
+12. **Reference answers are missing.** Without golden answers, answer correctness and regression detection remain limited.
 
-For a stronger RAG architecture, the next version should look like:
+## Development roadmap
 
-```text
-                         Question
-                            |
-                            v
-                   Query Classification
-                            |
-          +-----------------+------------------+
-          |                 |                  |
-          v                 v                  v
-       Dense             BM25             Numerical
-     Retrieval          Retrieval          Retrieval
-          |                 |                  |
-          +-----------------+------------------+
-                            |
-                            v
-                    Candidate Fusion
-                         (RRF)
-                            |
-                            v
-                       Reranking
-                            |
-                            v
-                    Context Builder
-                            |
-                            v
-                    Grounded LLM
-                            |
-                            v
-                  Claim / Number Check
-                            |
-                   +--------+--------+
-                   |                 |
-                Supported        Unsupported
-                   |                 |
-                   v                 v
-             Final Answer       Refusal
-```
+### Phase 1: Baseline
 
-For this annual-report use case, this architecture is more valuable than adding agents unnecessarily.
+- PDF extraction
+- Text and table chunking
+- MiniLM embeddings
+- FAISS retrieval
+- BM25 reranking
+- FLAN-T5 generation
+- Basic numerical validation
 
----
+### Phase 2: Retrieval optimization
 
-# 16. Why This Is a RAG Architecture Project
+- Full-file SHA-256 fingerprints
+- Better structural chunking
+- Context-rich table representations
+- Independent dense and BM25 retrieval
+- Reciprocal Rank Fusion
+- Query-type routing
 
-The project demonstrates several important RAG engineering concepts:
+### Phase 3: Financial reasoning
 
-### Ingestion
+- Entity and number extraction
+- Fiscal-year normalization
+- Unit normalization
+- Threshold filtering
+- Arithmetic validation
 
-PDF → text + tables
+### Phase 4: Grounding
 
-### Representation
+- Claim extraction
+- Evidence-to-claim mapping
+- Entailment validation
+- Unsupported-claim detection
+- More precise refusal logic
 
-Text/table content → chunks + metadata
+### Phase 5: Evaluation
 
-### Retrieval
+- Golden answers
+- Retrieval metrics
+- Faithfulness and completeness scoring
+- Refusal accuracy
+- Baseline-versus-improved regression tests
 
-Dense embeddings + FAISS
+### Phase 6: Productionization
 
-### Hybrid retrieval
+- Modular package structure
+- API layer
+- Observability
+- Performance testing
+- Security controls
+- Model and version tracking
+- Model governance
 
-Dense candidates + BM25 reranking
+## Engineering philosophy
 
-### Generation
-
-Evidence-constrained open-source LLM
-
-### Grounding
-
-Post-generation evidence validation
-
-### Evaluation
-
-Fixed question set + structured JSON results
-
-The next maturity level is not simply adding more frameworks. It is improving:
+This project avoids adding frameworks such as LangChain, LangGraph, MCP, or multi-agent orchestration without a demonstrated need. For a single annual report, the highest-value improvements are:
 
 ```text
 retrieval recall
@@ -826,102 +361,12 @@ retrieval recall
 → reproducibility
 ```
 
----
-
-# 17. Suggested Development Roadmap
-
-## Phase 1 — Current baseline
-
-- PDF extraction
-- Chunking
-- MiniLM
-- FAISS
-- BM25 reranking
-- FLAN-T5
-- Basic validation
-
-## Phase 2 — Retrieval optimization
-
-- Full-document SHA-256 fingerprint
-- Better structural chunking
-- Table-aware chunks
-- Independent BM25 retrieval
-- Reciprocal Rank Fusion
-- Better reranking
-- Query-type routing
-
-## Phase 3 — Financial reasoning
-
-- Numeric/entity extraction
-- Fiscal-year normalization
-- Unit normalization
-- Threshold filtering
-- Arithmetic validation
-
-## Phase 4 — Grounding
-
-- Claim extraction
-- Evidence mapping
-- Entailment validation
-- Unsupported-claim detection
-- Better refusal logic
-
-## Phase 5 — Evaluation
-
-- Golden answers
-- Retrieval Recall@K
-- MRR / nDCG
-- Faithfulness
-- Answer correctness
-- Refusal accuracy
-- Regression testing
-
-## Phase 6 — Productionization
-
-- Modular package structure
-- Observability
-- Model/version tracking
-- CI/CD
-- Containerization
-- API layer
-- Security
-- Performance testing
-- Model governance
-
----
-
-# 18. Engineering Philosophy
-
-The project deliberately avoids introducing frameworks such as LangChain, LangGraph, MCP, or multi-agent orchestration unless they solve a demonstrated problem.
-
-For a document-question-answering system over one annual report, architectural quality is better demonstrated through:
-
-```text
-better retrieval
-+
-better evidence representation
-+
-better numerical handling
-+
-better grounding
-+
-better evaluation
-```
-
-rather than framework complexity.
-
----
-
-# 19. License
+## License
 
 MIT License.
-
----
 
 ## Author
 
 **Dwaipayan Dutta**
 
-GitHub:
-
-https://github.com/DwaipayanDutta/RAG-Pipeline-Hackathon
+[GitHub repository](https://github.com/DwaipayanDutta/RAG-Pipeline-Hackathon)

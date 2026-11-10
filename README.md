@@ -1,372 +1,328 @@
-# Titan Annual Report RAG Pipeline
+# Titan Annual Report RAG Pipeline (with Jev Gating)
 
-An evaluation-oriented Retrieval-Augmented Generation (RAG) pipeline for answering questions from the **Titan Company Limited Integrated Annual Report 2025–26**.
+An evaluation-oriented and production-grade Retrieval-Augmented Generation (RAG) pipeline engineered for answering questions from the **Titan Company Limited Integrated Annual Report 2025–26**.
 
-The project demonstrates the core engineering concerns of document question answering:
+This repository implements two core architectural approaches for processing complex financial queries:
 
-- PDF text and table extraction
-- Structure-aware chunking with source metadata
-- Semantic retrieval with Sentence Transformers and FAISS
-- Lexical reranking with BM25
-- Evidence-constrained generation with FLAN-T5
-- Lightweight validation of generated numerical claims
-- Reproducible evaluation over a fixed question set
-- Explicit refusal when the document does not contain enough evidence
+1. **Standard RAG (`rag_pipeline.py`):** Hybrid retrieval (Dense FAISS + Sparse BM25 + Reciprocal Rank Fusion), table structure extraction, entity-metric-fiscal-year grounding, deterministic numerical reasoning engines, and post-generation numeric validation.
+2. **Jev + RAG (`rag_pipeline_jev.py`):** An advanced variation incorporating **Jev Reranking & Dynamic Relevance Gating**. Retrieved candidate passages are evaluated by TypeSafe's Jev model; passages below `jev_threshold` are filtered out prior to LLM synthesis, preventing hallucination and enabling dual-layer refusal.
 
-> **Project status:** This is an evaluation and portfolio implementation, not a production-ready enterprise RAG platform. Production use would require stronger observability, security, testing, model governance, latency and cost controls, and claim-level grounding evaluation.
+> 📦 **Repository:** [github.com/DwaipayanDutta/RAG-Pipeline-Hackathon](https://github.com/DwaipayanDutta/RAG-Pipeline-Hackathon)
 
-## Problem statement
+---
 
-The pipeline answers a fixed set of questions about Titan's FY2025–26 annual report. The evaluation set covers several common RAG challenges:
+## 🏗️ Architecture: Standard RAG vs. Jev + RAG
 
-| Question type | Example capability |
-| --- | --- |
-| Semantic and causal | Explain what drove Jewellery Division growth |
-| Financial tables | Extract KPIs for FY2025–26 and FY2024–25 |
-| Numerical filtering | Identify businesses with double-digit growth |
-| Threshold comparisons | Find businesses above INR 5,000 crore |
-| Cross-section reasoning | Combine evidence from multiple report sections |
-| Strategy retrieval | Find initiatives and programmes |
-| Out-of-document handling | Refuse unsupported FY2027 questions |
+Below is the architectural workflow comparing standard RAG against the enhanced **Jev + RAG** pipeline with relevance-based gating and abstention layers:
 
-When the report does not provide sufficient evidence, the expected response is:
-
-```text
-I don't know from the document.
-```
-
-## Architecture
+![RAG vs Jev + RAG](image.jpeg)
 
 ```text
 Titan annual report PDF
         |
         v
-PDF extraction with pdfplumber
+PDF extraction with pdfplumber & table normalization
         |
         v
-Text cleaning and table conversion
+Structure-aware page and paragraph chunks + metadata enrichment
         |
-        v
-Structure-aware page and paragraph chunks
-        |
-        +--> Sentence Transformer embeddings
-        |          |
-        |          v
-        |     FAISS cosine-style index
+        +--> Sentence Transformer embeddings (FAISS index)
         |
         +--> BM25 lexical index
-                   |
-                   v
-        Candidate fusion and reranking
-                   |
-                   v
-        Evidence context and question
-                   |
-                   v
-        FLAN-T5 grounded generation
-                   |
-                   v
-        Number validation and refusal logic
-                   |
-                   v
-        results.json with answers and evidence
+        |
+        v
+Hybrid retrieval + Reciprocal Rank Fusion (RRF)
+        |
+        v
+  [Optional Jev Gate / Reranker]
+        |
+        +---> Below threshold? ---> Refuse: "I don't know from the document."
+        |
+        v (Kept candidates)
+Evidence context and question
+        |
+        v
+Reasoning Engine / Grounded Generation (FLAN-T5)
+        |
+        v
+Grounding validation & numeric verification
+        |
+        v
+results.json with answers, confidence, citations, and evidence
 ```
 
-## How retrieval works
+### Pipeline Comparison
 
-The pipeline uses a two-stage retrieval strategy:
+| Component / Feature | Standard RAG (`rag_pipeline.py`) | Jev + RAG (`rag_pipeline_jev.py`) |
+| :--- | :--- | :--- |
+| **Retrieval Strategy** | Dense (FAISS) + Sparse (BM25) fused via RRF | Dense (FAISS) + Sparse (BM25) fused via RRF |
+| **Candidate Gating** | Cross-Encoder Reranking (Top-K) | Jev Reranking & Dynamic Relevance Gating |
+| **Noise Filtering** | Passages passed directly to LLM | Drops passages below threshold (`--jev-threshold`) |
+| **Abstention Mechanism** | Grounding validation post-LLM | Dual-layer: Jev gate abstention + Grounding validation |
+| **Hallucination Rate** | Low (bounded by context) | Ultra-low (unsupported queries gated early) |
 
-1. Embed the question with `sentence-transformers/all-MiniLM-L6-v2`.
-2. Retrieve the top 15 candidates from a normalized `FAISS IndexFlatIP` index.
-3. Remove duplicate page and text entries.
-4. Rerank the dense candidates with BM25 when `rank-bm25` is installed.
-5. Combine normalized scores using a 70% dense and 30% lexical weighting.
-6. Pass the top five chunks to the generation step.
+---
 
-Dense retrieval helps with paraphrased questions, while BM25 improves matching for exact business names, financial terms, fiscal years, percentages, and values.
+## 🎯 Problem Statement
 
-## Document processing
+The pipeline answers a fixed set of questions about Titan's FY2025–26 annual report. The evaluation set covers several common RAG challenges:
 
-The report is processed page by page. Each extracted chunk retains traceability metadata:
+| Question type | Example capability |
+| :--- | :--- |
+| **Semantic and causal** | Explain what drove Jewellery Division growth |
+| **Financial tables** | Extract KPIs for FY2025–26 and FY2024–25 |
+| **Numerical filtering** | Identify businesses with double-digit growth |
+| **Threshold comparisons** | Find businesses above INR 5,000 crore |
+| **Cross-section reasoning** | Combine evidence from multiple report sections |
+| **Strategy retrieval** | Find initiatives and programmes |
+| **Out-of-document handling** | Refuse unsupported FY2027 questions |
 
-```json
-{
-  "chunk_id": 42,
-  "page": 137,
-  "source_type": "table_row",
-  "table_id": "table_137_1",
-  "text": "Revenue: INR ..."
-}
-```
-
-Text chunks use approximately:
-
-| Setting | Default |
-| --- | ---: |
-| Text chunk size | 400 words |
-| Chunk overlap | 80 words |
-| Dense retrieval candidates | 15 |
-| Final context chunks | 5 |
-
-Tables are represented as row-level chunks in the form:
-
-```text
-Header: Value | Header: Value | ...
-```
-
-This preserves useful financial values and source-page information, while the limitations below describe where table representation can be improved.
-
-## Generation and grounding
-
-Generation uses:
-
-```text
-google/flan-t5-base
-```
-
-The model is instructed to answer only from the retrieved context and to return the refusal phrase when the context is insufficient. Sampling is disabled for deterministic generation:
-
-```text
-do_sample=False
-```
-
-After generation, the validation layer extracts numerical claims and checks whether the values appear in the retrieved evidence. Answers containing unsupported numbers are rejected and replaced with:
+When the report does not provide sufficient evidence or fails grounding checks, the expected response is:
 
 ```text
 I don't know from the document.
 ```
 
-This is a useful guardrail, but it is not a complete factuality validator. Numeric presence alone does not prove that a value belongs to the correct entity, year, unit, or calculation.
+---
 
-## Project structure
+## 🚀 Key Features & Capabilities
+
+1. **Hybrid Retrieval with Reciprocal Rank Fusion (RRF):**
+   - **Dense Retrieval:** FAISS vector index using `sentence-transformers/all-MiniLM-L6-v2` embeddings.
+   - **Sparse Retrieval:** BM25Okapi keyword index for high-precision search on financial codes, names, and exact metrics.
+   - **Rank Fusion:** Blends dense and sparse retrieval ranks without score calibration mismatch.
+
+2. **Jev Reranking & Dynamic Relevance Gating (`--use-jev`):**
+   - Integrates TypeSafe's Jev model to evaluate candidate relevance scores.
+   - Filters out irrelevant context using a configurable threshold (`--jev-threshold`, default `0.2`), preventing noisy inputs from reaching the generator.
+   - Gracefully degrades to standard RAG if the `jev-reranker` package or API key is unavailable.
+
+3. **Structured Table Extraction & Header-Aware Mapping:**
+   - Extracts multi-row, multi-column tables using `pdfplumber`.
+   - Maps table headers dynamically to fiscal years (e.g., `FY2025-26`) and metrics (e.g., `revenue`, `profit_before_tax`).
+
+4. **Deterministic Numerical Reasoning Engines:**
+   - Bypasses LLM math limitations for high-precision financial operations:
+     - **Threshold Engine:** Filters entities meeting condition criteria (e.g., *exceeding 5000 crore*, *double-digit growth*).
+     - **Comparison Engine:** Calculates absolute and percentage YoY deltas across fiscal years.
+     - **Ranking Engine:** Sorts entities highest/lowest for given financial metrics.
+     - **Aggregation Engine:** Computes sum, average, max, and min values.
+
+5. **Multi-Layer Refusal & Grounding Validation:**
+   - Verifies all numerical claims, metrics, entities, and fiscal years against extracted evidence records.
+   - Enforces strict abstention (`"I don't know from the document."`) if claims cannot be textually or mathematically grounded.
+
+---
+
+## 📁 Project Structure
 
 ```text
 Titan-RAG/
-├── rag_pipeline.py
-├── queries.json
-├── results.json
-├── requirements.txt
-├── README.md
-├── Titan AR 2026_0.pdf
-└── index/
-    ├── index_<fingerprint>.faiss
-    └── metadata_<fingerprint>.json
+├── rag_pipeline.py          # Core production-grade RAG pipeline (Standard RAG)
+├── rag_pipeline_jev.py      # Extended pipeline with Jev reranking and gating
+├── test_rag_pipeline_jev.py # Unit and integration tests for Jev gating logic
+├── requirements.txt         # Core Python dependencies
+├── image.jpeg               # Architectural comparison diagram
+├── queries.json             # Fixed evaluation query set
+├── results.json             # Execution and benchmark output
+└── README.md                # Project documentation
 ```
 
-The main pipeline is intentionally kept in one Python file so that the hackathon implementation is easy to run and inspect. A production implementation should separate ingestion, retrieval, generation, validation, and evaluation into modules.
+*(Note: The `approach 2` directory is deprecated and excluded from this pipeline implementation.)*
 
-## Requirements
+---
 
+## 🛠️ Requirements & Setup
+
+### Requirements
 - Python 3.9 or newer
-- The Titan annual report PDF
-- Sufficient disk space for downloaded model weights and the generated FAISS index
+- Titan Annual Report PDF (`Titan_AR_2026.pdf`)
+- Disk space for cached index files (`index_cache/`) and transformer model weights
 
-Install the Python dependencies:
+### 1. Clone the repository
+```bash
+git clone https://github.com/DwaipayanDutta/RAG-Pipeline-Hackathon.git
+cd RAG-Pipeline-Hackathon
+```
 
+### 2. Install dependencies
 ```bash
 pip install -r requirements.txt
 ```
 
-The current dependency set includes:
-
-```text
-pdfplumber
-sentence-transformers
-faiss-cpu
-torch
-transformers
-numpy
-rank-bm25
-pytest
-```
-
-## Running the pipeline
-
-Run with the default PDF and evaluation questions:
+### 3. Configure Jev (Optional)
+The Jev gating feature requires a TypeSafe API key and the `jev-reranker` package:
 
 ```bash
-python rag_pipeline.py
+pip install jev-reranker
+export TYPESAFE_API_KEY="your-api-key-here"
 ```
 
-Provide custom input and output paths:
+> ⚠️ If the package or API key is missing, `rag_pipeline_jev.py` logs a warning and automatically falls back to the standard RAG path — the pipeline will still work seamlessly without Jev.
+
+---
+
+## 💡 Running the Pipeline
+
+### Standard RAG Pipeline
+Run with default inputs or pass custom query strings:
 
 ```bash
-python rag_pipeline.py \
-  --pdf "Titan AR 2026_0.pdf" \
+python3 rag_pipeline.py --pdf Titan_AR_2026.pdf --query "What was Titan's total revenue in FY2025-26?"
+```
+
+### Jev-Augmented RAG Pipeline
+Enable Jev reranking and gating with custom relevance thresholds:
+
+```bash
+python3 rag_pipeline_jev.py \
+  --pdf Titan_AR_2026.pdf \
+  --use-jev \
+  --jev-threshold 0.2 \
+  --query "Which business segments achieved double-digit growth?"
+```
+
+### Batch Evaluation
+Process a full question set and export structured results:
+
+```bash
+python3 rag_pipeline_jev.py \
+  --pdf Titan_AR_2026.pdf \
   --queries queries.json \
-  --output results.json
+  --output results.json \
+  --use-jev
 ```
 
-Force the retrieval index to be rebuilt:
+### Rebuild Retrieval Index
+Force index re-indexing when updating the document:
 
 ```bash
-python rag_pipeline.py --rebuild-index
+python3 rag_pipeline.py --rebuild-index
 ```
 
-Provide optional configuration through JSON:
+### Running the Test Suite
+Verify pipeline functionality and Jev gating behavior:
 
 ```bash
-python rag_pipeline.py --config config.json
+python3 -m unittest test_rag_pipeline_jev.py -v
 ```
 
-## Configuration
+---
 
-The main configuration values are:
+## ⚙️ Configuration & CLI Reference
 
-| Parameter | Default | Purpose |
-| --- | ---: | --- |
+| Flag / Parameter | Default | Purpose |
+| :--- | :--- | :--- |
+| `--pdf` | `Titan_AR_2026.pdf` | Path to the annual report PDF |
+| `--query` | `None` | Single query string to evaluate |
+| `--queries` | `None` | Path to JSON file with a list of queries |
+| `--output` | `stdout` | Path to write output JSON results |
+| `--config` | `None` | Path to a JSON configuration override file |
+| `--rebuild-index` | `False` | Force rebuild of FAISS and BM25 index caches |
+| `--use-jev` | `False` | Enable Jev reranking & gating (`rag_pipeline_jev.py`) |
+| `--jev-threshold` | `0.2` | Relevance threshold for Jev gating (0.0 to 1.0) |
 | `chunk_size` | `400` | Text chunk size in words |
-| `chunk_overlap` | `80` | Overlap between text chunks |
-| `top_k_retrieval` | `15` | Number of dense candidates |
-| `top_k_final` | `5` | Number of evidence chunks used for generation |
-| `use_reranker` | `true` | Enable BM25 reranking |
-| `relevance_threshold` | `null` | Optional relevance cutoff |
-| `max_prompt_tokens` | `512` | Intended prompt budget |
-| `seed` | `42` | Reserved deterministic seed |
-| `embedding_model` | MiniLM-L6-v2 | Sentence embedding model |
-| `generation_model` | FLAN-T5-base | Text generation model |
+| `chunk_overlap` | `80` | Word overlap between text chunks |
+| `dense_top_k` | `20` | Number of dense candidates retrieved |
+| `bm25_top_k` | `20` | Number of lexical candidates retrieved |
+| `final_top_k` | `5` | Number of context chunks supplied for generation |
 
-## Output format
+---
 
-The pipeline writes structured results to `results.json`:
+## 📊 Output Format
+
+The pipeline outputs structured JSON containing grounded answers, confidence scores, citations, and execution validation:
 
 ```json
 [
   {
-    "id": 1,
-    "query": "What were the key factors that contributed to the growth of Titan's Jewellery Division during FY2025-26?",
-    "answer": "...",
-    "retrieved_chunks": [
+    "query": "What was Titan's total revenue in FY2025-26?",
+    "query_type": "NUMERIC",
+    "answer": "Titan's total revenue was 51,084 INR crore in FY2025-26.",
+    "grounded": true,
+    "grounding_status": "grounded",
+    "confidence": 1.0,
+    "citations": [
       {
         "page": 33,
-        "chunk_id": 42,
-        "source_type": "text",
-        "score": 0.812
+        "chunk_id": 42
       }
     ],
-    "grounded": true
+    "retrieved_chunks": [
+      {
+        "chunk_id": 42,
+        "page": 33,
+        "source_type": "table",
+        "score": 0.0
+      }
+    ],
+    "validation": {
+      "numeric_grounding": true,
+      "entity_grounding": true,
+      "metric_grounding": true,
+      "fiscal_year_grounding": true
+    },
+    "refusal_reason": null,
+    "jev_scores": [
+      {
+        "chunk_id": 42,
+        "score": 0.94,
+        "index": 0
+      }
+    ]
   }
 ]
 ```
 
-The evidence metadata makes it possible to audit answers, debug retrieval, and compare pipeline versions.
+---
 
-## Evaluation principles
+## 🧪 Testing
 
-Keep `queries.json` unchanged when comparing pipeline versions. Separating evaluation questions from pipeline code helps ensure that improvements are measured against the same test set.
+`test_rag_pipeline_jev.py` covers key pipeline components:
 
-The current output format is useful for manual inspection. A fuller evaluation harness should add:
+1. **Configuration tests:** Verifies `use_jev`, `jev_threshold`, and `jev_api_key_env` CLI/config handling.
+2. **Jev gating unit tests:** Mocks `JevReranker.relevance_rerank` to verify relevant chunks pass, low-relevance chunks are filtered out, and graceful fallback occurs if Jev is unavailable.
+3. **End-to-end integration tests:** Mocks PDF ingestion and LLM generation to ensure `QueryResult.jev_scores` propagate and the pipeline safely abstains (`"I don't know from the document."`) if Jev gates all candidates.
 
-### Retrieval metrics
+---
 
-- Recall@K
-- Precision@K
-- Mean Reciprocal Rank (MRR)
-- nDCG
+## 🔍 Identified Gaps & Development Roadmap
 
-### Generation metrics
+### Known Limitations & Gaps
+1. **API Fallback & Resilience:** Exception handling currently falls back to standard RAG if the Jev service is unreachable. Asynchronous retries with exponential backoff should be added.
+2. **Complex Multi-Page Tables:** While standard multi-header grids are normalized, multi-page nested tables with irregular row spans and inline footnotes require further structural parsing.
+3. **Multi-Document Scaling:** Current indexing is optimized for single annual reports per run. Cross-company multi-year benchmarking requires scaling vector store schemas.
+4. **Evaluation Harness:** Automated benchmarks against golden QA datasets (e.g., FinQA, TAT-QA) can further track precision/recall regressions over time.
 
-- Answer correctness
-- Faithfulness or groundedness
-- Completeness
+### Development Roadmap
+- [x] **Phase 1: Baseline** (PDF extraction, text/table chunking, MiniLM embeddings, FAISS retrieval, FLAN-T5 generation, basic validation)
+- [x] **Phase 2: Hybrid Retrieval & Gating** (Full SHA-256 caching, BM25 + FAISS RRF, Jev dynamic gating, query-type routing)
+- [x] **Phase 3: Financial Reasoning Engines** (Threshold, YoY comparison, ranking, and aggregation engines)
+- [x] **Phase 4: Multi-Layer Grounding & Refusal** (Evidence record mapping, dimension validation, explicit abstention)
+- [ ] **Phase 5: Automated Evaluation Harness** (Golden QA scoring, retrieval metrics: Recall@K, MRR, nDCG)
+- [ ] **Phase 6: Multi-Document Productionization** (Async API layer, multi-filing vector stores, observability)
 
-### Safety metrics
+---
 
-- Out-of-document refusal accuracy
-- Unsupported-number rate
-- Unsupported-claim rate
+## 💡 Engineering Philosophy
 
-## Known limitations
-
-The current implementation is intentionally lightweight. The main limitations are:
-
-1. **The document fingerprint is partial.** It samples early PDF content rather than hashing the complete file.
-2. **Cleaning can remove structure.** Normalizing whitespace before chunking can weaken paragraph detection.
-3. **Table context is incomplete.** Row chunks may omit table titles, section names, units, multi-row headers, and nearby explanations.
-4. **BM25 cannot recover dense misses.** Lexical reranking currently runs only over dense candidates.
-5. **Score weighting is query-relative.** Dense and BM25 scores are normalized within the current candidate set.
-6. **Numerical reasoning is implicit.** Retrieval and generation do not guarantee correct unit normalization, filtering, or arithmetic.
-7. **Grounding validation is primarily numeric.** Qualitative claims and entity-year relationships are not fully checked.
-8. **Prompt budgeting is approximate.** A robust implementation should budget context using the selected model tokenizer.
-9. **Model loading can be inefficient.** The generation model should be loaded once and reused across questions.
-10. **Reproducibility metadata is incomplete.** Results should record full document hashes, model versions, library versions, and configuration.
-11. **`grounded` is a coarse status.** It should eventually distinguish retrieval support, answer validation, full grounding, and refusal.
-12. **Reference answers are missing.** Without golden answers, answer correctness and regression detection remain limited.
-
-## Development roadmap
-
-### Phase 1: Baseline
-
-- PDF extraction
-- Text and table chunking
-- MiniLM embeddings
-- FAISS retrieval
-- BM25 reranking
-- FLAN-T5 generation
-- Basic numerical validation
-
-### Phase 2: Retrieval optimization
-
-- Full-file SHA-256 fingerprints
-- Better structural chunking
-- Context-rich table representations
-- Independent dense and BM25 retrieval
-- Reciprocal Rank Fusion
-- Query-type routing
-
-### Phase 3: Financial reasoning
-
-- Entity and number extraction
-- Fiscal-year normalization
-- Unit normalization
-- Threshold filtering
-- Arithmetic validation
-
-### Phase 4: Grounding
-
-- Claim extraction
-- Evidence-to-claim mapping
-- Entailment validation
-- Unsupported-claim detection
-- More precise refusal logic
-
-### Phase 5: Evaluation
-
-- Golden answers
-- Retrieval metrics
-- Faithfulness and completeness scoring
-- Refusal accuracy
-- Baseline-versus-improved regression tests
-
-### Phase 6: Productionization
-
-- Modular package structure
-- API layer
-- Observability
-- Performance testing
-- Security controls
-- Model and version tracking
-- Model governance
-
-## Engineering philosophy
-
-This project avoids adding frameworks such as LangChain, LangGraph, MCP, or multi-agent orchestration without a demonstrated need. For a single annual report, the highest-value improvements are:
+This project avoids adding heavy framework abstractions (e.g., LangChain, LangGraph, MCP) without demonstrated need. For complex financial reports, the highest-value engineering improvements are:
 
 ```text
 retrieval recall
-→ ranking precision
-→ numerical reasoning
-→ grounding
-→ evaluation
-→ reproducibility
+→ rank precision & gating
+→ numerical reasoning engines
+→ claim grounding validation
+→ reproducible evaluation
 ```
 
-## License
+---
 
-MIT License.
+## 📜 License
 
-## Author
+Distributed under the MIT License.
 
-**Dwaipayan Dutta**
+## 👤 Author
 
-[GitHub repository](https://github.com/DwaipayanDutta/RAG-Pipeline-Hackathon)
+**Dwaipayan Dutta**  
+[GitHub Repository](https://github.com/DwaipayanDutta/RAG-Pipeline-Hackathon)

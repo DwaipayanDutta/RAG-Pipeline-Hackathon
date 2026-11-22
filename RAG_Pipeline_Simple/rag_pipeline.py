@@ -214,8 +214,9 @@ def parse_financial_value(text: str) -> Tuple[Optional[float], Optional[str], bo
     is_pct = "%" in text
     # Remove currency symbols and commas
     cleaned = re.sub(r"[₹$,€£]", "", text)
-    # Extract number
-    match = re.search(r"(\d{1,3}(?:,\d{3})*(?:\.\d+)?)", cleaned)
+    # Extract number (commas are already stripped, so take the whole digit run;
+    # the old \d{1,3}(?:,\d{3})* pattern truncated 51084 to 510)
+    match = re.search(r"(\d+(?:\.\d+)?)", cleaned)
     if not match:
         return None, None, False
     val = safe_float(match.group(1))
@@ -263,7 +264,7 @@ def parse_threshold(query: str) -> Optional[Dict[str, Any]]:
     operator = op_map.get(op, ">")
 
     # Extract number and unit
-    num_pattern = r"(\d{1,3}(?:,\d{3})*(?:\.\d+)?)\s*(?:%|crore|million|billion|INR|₹)?"
+    num_pattern = r"(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)\s*(?:%|crore|million|billion|INR|₹)?"
     num_match = re.search(num_pattern, query)
     if not num_match:
         return None
@@ -1125,7 +1126,10 @@ def validate_answer(answer: str, chunks: List[Chunk]) -> Tuple[bool, Dict[str, b
     evidence = extract_structured_evidence_from_chunks(chunks)
 
     # Extract numeric claims from answer
-    numbers = re.findall(r"(\d{1,3}(?:,\d{3})*(?:\.\d+)?)", answer)
+    # Whole numbers only ("5000" is one claim, not "500" + "0"); fiscal-year labels such as
+    # FY2025-26 are validated separately, so their digits are not numeric claims.
+    answer_wo_fy = re.sub(r"(?:FY\s*)?\d{2,4}\s*[-–]\s*\d{2}\b", " ", answer, flags=re.IGNORECASE)
+    numbers = re.findall(r"(?<![\d.,])(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)(?![\d,])", answer_wo_fy)
     claims = []
     for num_str in numbers:
         val = safe_float(num_str)
@@ -1318,9 +1322,20 @@ def run_pipeline(pdf_path: str, query: str, config: Dict[str, Any], rebuild: boo
 # -------------------------------------------------------------------------
 # CLI
 # -------------------------------------------------------------------------
+#: The Titan annual report shipped with the repository (works from any working directory).
+DEFAULT_PDF = str(Path(__file__).resolve().parents[1] / "Data and Question" / "Titan AR 2026_0.pdf")
+
+
+def load_queries(path: str) -> List[str]:
+    """Read a queries file: a JSON list of strings or of {"query": ...} objects (Data and Question/queries.json)."""
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return [q["query"] if isinstance(q, dict) else str(q) for q in data]
+
+
 def main():
     parser = argparse.ArgumentParser(description="Champion RAG Pipeline for Annual Reports")
-    parser.add_argument("--pdf", default="Titan_AR_2026.pdf", help="Path to PDF file")
+    parser.add_argument("--pdf", default=DEFAULT_PDF, help="Path to PDF file (default: the bundled Titan report)")
     parser.add_argument("--query", type=str, help="Single query string")
     parser.add_argument("--queries", type=str, help="Path to JSON file with list of queries")
     parser.add_argument("--output", type=str, help="Output JSON file path")
@@ -1334,8 +1349,7 @@ def main():
     if args.query:
         queries = [args.query]
     elif args.queries:
-        with open(args.queries, "r") as f:
-            queries = json.load(f)
+        queries = load_queries(args.queries)
     else:
         print("Enter your query (type 'exit' to quit):")
         while True:

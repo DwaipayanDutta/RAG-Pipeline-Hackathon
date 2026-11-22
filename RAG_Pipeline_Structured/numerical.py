@@ -29,6 +29,6 @@ def normalize_crore(val, unit):
         return val  # assume raw
 
 def filter_by_threshold(candidates: List[Dict], threshold: float, metric: str = "revenue") -> List:
-    # Simplified: assume candidates have "text" and we extract numbers
-    # We'll rely on LLM for now; this is placeholder.
-    pass
+    """Not implemented in this package (see handle_threshold_query in RAG_Pipeline_Simple/rag_pipeline.py)."""
+    raise NotImplementedError("Threshold filtering is implemented in RAG_Pipeline_Simple/rag_pipeline.py "
+                              "(handle_threshold_query); the structured package does not use it yet.")

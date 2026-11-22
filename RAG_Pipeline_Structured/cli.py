@@ -1,28 +1,43 @@
-# cli.py (in rag_pipeline package)
+"""CLI for the structured pipeline: `python -m RAG_Pipeline_Structured {query,evaluate} ...`."""
 import argparse
-from .config import RAGConfig
-from .evaluation import run_evaluation
-from .pipeline import RAGPipeline
 import json
+import logging
+from typing import List, Optional
 
-def main():
-    parser = argparse.ArgumentParser()
-    subparsers = parser.add_subparsers(dest="command")
+from .config import RAGConfig
 
-    eval_parser = subparsers.add_parser("evaluate")
-    eval_parser.add_argument("--config", default="configs/default.json")
 
-    query_parser = subparsers.add_parser("query")
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(prog="python -m RAG_Pipeline_Structured")
+    parser.add_argument("--config", default=None, help="JSON file with RAGConfig overrides")
+    parser.add_argument("--pdf", default=None, help="PDF to index (default: the bundled Titan report)")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    eval_parser = subparsers.add_parser("evaluate", help="Answer every query in queries.json")
+    eval_parser.add_argument("--queries", default=None)
+    eval_parser.add_argument("--output", default=None)
+
+    query_parser = subparsers.add_parser("query", help="Answer one question")
     query_parser.add_argument("--question", required=True)
-    query_parser.add_argument("--config", default="configs/default.json")
 
-    args = parser.parse_args()
-    # Load config (simplified)
-    config = RAGConfig()  # would load from file
+    args = parser.parse_args(argv)
+    config = RAGConfig.from_json(args.config)
+    if args.pdf:
+        config.pdf_path = args.pdf
+    logging.basicConfig(level=config.log_level)
+
+    # Imported here so `--help` works without the heavy ML dependencies.
+    from .evaluation import run_evaluation
+    from .pipeline import RAGPipeline
 
     if args.command == "evaluate":
-        run_evaluation(config)
-    elif args.command == "query":
-        pipeline = RAGPipeline(config)
-        result = pipeline.process(args.question)
+        if args.queries:
+            config.queries_path = args.queries
+        if args.output:
+            config.output_path = args.output
+        results = run_evaluation(config)
+        print(f"Wrote {len(results)} results to {config.output_path}")
+    else:
+        result = RAGPipeline(config).process(args.question)
         print(json.dumps(result, indent=2))
+    return 0

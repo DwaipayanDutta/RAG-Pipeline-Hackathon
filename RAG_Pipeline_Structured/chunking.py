@@ -1,4 +1,4 @@
-from typing import List
+from typing import Dict, List
 from .models import Chunk, Table
 from .ingestion import normalize_text
 import re

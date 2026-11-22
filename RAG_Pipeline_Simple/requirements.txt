@@ -1,3 +1,6 @@
+# Dependencies for RAG_Pipeline_Simple (also used by RAG_Pipeline_Jev and RAG_Pipeline_Structured).
+#   pip install -r RAG_Pipeline_Simple/requirements.txt
+
 # Core PDF & document processing
 pdfplumber>=0.9.0
 # Embedding & retrieval
@@ -9,7 +12,8 @@ scipy>=1.7.0
 # LLM / generation
 transformers>=4.20.0
 torch>=1.10.0
+# Tests
+pytest>=7.0
 
-# Jev reranking & gating (optional — required only for the Jev + RAG variant)
-# Install with: pip install -r requirements.txt  (or pip install jev-reranker)
-jev-reranker>=0.1.0
+# jev-reranker is only needed by RAG_Pipeline_Jev (--use-jev); it now lives in
+# RAG_Pipeline_Jev/requirements.txt so this pipeline installs without it.

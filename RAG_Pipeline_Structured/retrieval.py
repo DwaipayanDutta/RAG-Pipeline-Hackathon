@@ -1,3 +1,4 @@
+import faiss
 import numpy as np
 from typing import List, Tuple
 from .models import Chunk, RetrievalCandidate
@@ -41,7 +42,7 @@ def reciprocal_rank_fusion(dense_cands: List[Tuple[Chunk, float]],
     sorted_chunks = sorted(chunk_to_score.items(), key=lambda x: x[1], reverse=True)
     # Return list of (chunk, rrf_score)
     # We need to retrieve the chunk objects
-    chunk_dict = {c.chunk_id: c for c in dense_cands + lexical_cands}
+    chunk_dict = {c.chunk_id: c for c, _ in dense_cands + lexical_cands}   # items are (chunk, score)
     result = []
     for cid, score in sorted_chunks:
         if cid in chunk_dict:
@@ -67,10 +68,6 @@ def retrieve(query: str, index_manager: IndexManager, config: RAGConfig) -> List
         # For simplicity, we'll keep only rrf_score.
         candidates.append(rc)
 
-    # Optional reranker
-    if config.use_reranker:
-        # (we'll implement reranking in reranking.py)
-        pass
-
-    # Return top final_top_k
-    return candidates[:config.final_top_k]
+    # Reranking happens in reranking.Reranker (called by the pipeline), so hand it the wider
+    # reranker_top_k pool; without a reranker, return the final_top_k directly.
+    return candidates[:config.reranker_top_k if config.use_reranker else config.final_top_k]

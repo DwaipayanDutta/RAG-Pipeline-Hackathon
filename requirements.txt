@@ -1,0 +1,9 @@
+# Everything needed to run every pipeline and test in this repository:
+#   pip install -r requirements.txt
+#
+# Per-pipeline files (install just one if you only need that pipeline):
+#   RAG_Pipeline_Graph/requirements_graph.txt   Graph RAG (only pdfplumber is strictly required)
+#   RAG_Pipeline_Simple/requirements.txt        Standard RAG (also used by Structured)
+#   RAG_Pipeline_Jev/requirements.txt           Standard RAG + optional jev-reranker
+-r RAG_Pipeline_Simple/requirements.txt
+-r RAG_Pipeline_Graph/requirements_graph.txt

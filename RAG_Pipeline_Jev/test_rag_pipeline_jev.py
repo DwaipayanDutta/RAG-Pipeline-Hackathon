@@ -98,7 +98,11 @@ class TestJevGating(unittest.TestCase):
 
 
 class TestPipelineIntegration(unittest.TestCase):
-    """Integration tests for the full pipeline (mocked LLM and Jev)."""
+    """Integration tests for the full pipeline (mocked LLM and Jev).
+
+    The Jev gate only runs when the jev-reranker package is importable AND an API key is set,
+    so both preconditions are mocked; the tests do not need network access or a real key.
+    """
 
     def setUp(self):
         self.temp_dir = tempfile.mkdtemp()
@@ -116,21 +120,26 @@ class TestPipelineIntegration(unittest.TestCase):
         import shutil
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
+    @patch.dict(os.environ, {"TYPESAFE_API_KEY": "test-key"})
+    @patch("rag_pipeline_jev.JEV_AVAILABLE", True)
+    @patch("rag_pipeline_jev.JevReranker")
     @patch("rag_pipeline_jev.extract_pdf_content")
     @patch("rag_pipeline_jev.Retriever.jev_gate")
     @patch("rag_pipeline_jev.generate_answer")
-    def test_pipeline_jev_gating_path(self, mock_generate, mock_jev_gate, mock_extract):
+    def test_pipeline_jev_gating_path(self, mock_generate, mock_jev_gate, mock_extract, _mock_jev_cls):
         # Setup mocks
         mock_extract.return_value = (
             [{"page": 1, "text": "Titan revenue was 5000 crore in FY2025-26."}],
             []
         )
+        # Gated chunks are enriched (evidence records attached) in the real pipeline, so the
+        # validator can ground numeric claims against them.
         mock_jev_gate.return_value = (
-            [pipeline.Chunk(chunk_id=0, page=1, section=None, source_type="text",
-                            text="Titan revenue was 5000 crore in FY2025-26.")],
+            pipeline.enrich_chunks([pipeline.Chunk(chunk_id=0, page=1, section=None, source_type="text",
+                                                   text="Titan revenue was 5000 crore in FY2025-26.")]),
             [{"chunk_id": 0, "score": 0.95, "index": 0}]
         )
-        mock_generate.return_value = ("Titan revenue was 5000 crore.", [{"page": 1}])
+        mock_generate.return_value = ("Titan revenue was 5000 crore in FY2025-26.", [{"page": 1}])
 
         result = pipeline.run_pipeline(
             self.pdf_path,
@@ -139,14 +148,17 @@ class TestPipelineIntegration(unittest.TestCase):
             rebuild=True
         )
 
-        self.assertTrue(result.grounded)
+        self.assertTrue(result.grounded, result.refusal_reason)
         self.assertIsNotNone(result.jev_scores)
         self.assertEqual(len(result.jev_scores), 1)
         self.assertEqual(result.jev_scores[0]["score"], 0.95)
 
+    @patch.dict(os.environ, {"TYPESAFE_API_KEY": "test-key"})
+    @patch("rag_pipeline_jev.JEV_AVAILABLE", True)
+    @patch("rag_pipeline_jev.JevReranker")
     @patch("rag_pipeline_jev.extract_pdf_content")
     @patch("rag_pipeline_jev.Retriever.jev_gate")
-    def test_pipeline_jev_refuses_when_no_evidence(self, mock_jev_gate, mock_extract):
+    def test_pipeline_jev_refuses_when_no_evidence(self, mock_jev_gate, mock_extract, _mock_jev_cls):
         mock_extract.return_value = ([{"page": 1, "text": "Some text."}], [])
         mock_jev_gate.return_value = ([], [])  # All chunks filtered
 

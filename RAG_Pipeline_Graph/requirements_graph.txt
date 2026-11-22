@@ -1,9 +1,31 @@
-# Extra dependencies for rag_pipeline_graph.py. Install on top of the existing requirements:
-#   pip install -r requirements_graph.txt
-#   python -m spacy download en_core_web_sm
-# jev-reranker is not needed here and stays optional for rag_pipeline_jev.py.
--r requirements.txt
-chromadb
-spacy
-# Only for generating the demo PDF via --seed-demo (not used by the pipeline itself):
-reportlab
+# Dependencies for RAG_Pipeline_Graph (self-contained; install from any directory):
+#
+#   pip install -r RAG_Pipeline_Graph/requirements_graph.txt
+#
+# Only pdfplumber is strictly required. Everything else has a built-in fallback:
+#   chromadb missing              -> in-memory JSON vector store
+#   sentence-transformers missing -> offline hash embeddings
+#   transformers/torch missing    -> only the default extractive generator is available
+#   spacy (model) missing         -> graph-node matching only for query entities
+# Minimal offline install:  pip install pdfplumber pytest
+
+# Required: PDF text extraction (Priority 3)
+pdfplumber>=0.10
+
+# Recommended: persistent vector DB + semantic embeddings
+chromadb>=0.5
+sentence-transformers>=2.2
+
+# Optional: FLAN-T5 answer generation (--llm flan-t5); also pulled in by sentence-transformers
+transformers>=4.30
+torch>=2.0
+
+# Optional: spaCy NER for query entities (then: python -m spacy download en_core_web_sm)
+spacy>=3.7
+
+# Optional: regenerate the sample PDFs (--generate-sample-pdfs); load RAG_Pipeline_Graph/.env
+reportlab>=4.0
+python-dotenv>=1.0
+
+# Tests
+pytest>=7.0

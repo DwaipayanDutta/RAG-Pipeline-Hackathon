@@ -1,38 +1,47 @@
 {
-  "chunk_size": 400,
-  "chunk_overlap": 80,
+  "db_path": "sample_data/cmdb.sql",
+  "db_tables": [
+    {"table": "services", "key_column": "service_name", "entity_type": "service", "timestamp_column": "updated_at"},
+    {"table": "teams", "key_column": "team_name", "entity_type": "team", "timestamp_column": "updated_at"},
+    {"table": "service_dependencies", "key_column": "service_name",
+     "edge_predicate": "depends_on", "object_column": "depends_on_service"}
+  ],
+  "live_db_refresh": true,
+  "wiki_dir": "sample_data/wiki",
+  "index_wiki_passages": true,
+  "use_llm_wiki_extraction": false,
+  "pdf_dir": "sample_data/pdfs",
+  "extract_pdf_facts": true,
+  "chunk_size": 120,
+  "chunk_overlap": 30,
+
+  "index_dir": ".graph_index",
+  "embedding_backend": "auto",
   "embedding_model": "sentence-transformers/all-MiniLM-L6-v2",
+  "vector_backend": "auto",
+
+  "known_entities": [],
+  "use_spacy": true,
+  "spacy_model": "en_core_web_sm",
+  "graph_top_k": 12,
+  "graph_hops": 2,
+  "traversal_predicates": ["on_call_engineer", "owner_team", "depends_on", "member", "manager", "escalation_contact"],
+  "vector_fallback_top_k": 3,
+  "vector_max_distance": 0.75,
+  "min_passage_overlap": 1,
+  "dedupe_jaccard": 0.8,
+
+  "priority_weights": {"cmdb": 1.0, "wiki": 0.6, "pdf": 0.3},
+  "single_valued_predicates": ["owner_team", "on_call_engineer", "status", "version", "environment", "sla_tier",
+                               "last_deployed_at", "manager", "slack_channel", "escalation_contact", "tier", "type"],
+
+  "llm_backend": "extractive",
   "generation_model": "google/flan-t5-base",
   "entity_extraction_model": "google/flan-t5-base",
-  "spacy_model": "en_core_web_sm",
   "max_context_tokens": 512,
   "max_answer_tokens": 150,
-  "index_dir": "graph_index_cache",
-  "db_path": "demo_graph_data/cmdb.sqlite",
-  "db_table": "services",
-  "db_key_column": "service_name",
-  "wiki_dir": "demo_graph_data/wiki",
-  "pdf_dir": "demo_graph_data/pdfs",
-  "use_llm_wiki_extraction": true,
-  "known_entities": [
-    "payments-service",
-    "checkout-service"
-  ],
-  "graph_top_k": 10,
-  "graph_hops": 1,
-  "traversal_predicates": [
-    "on_call_engineer",
-    "owner_team",
-    "depends_on",
-    "member_of"
-  ],
-  "vector_fallback_top_k": 2,
-  "vector_max_distance": 0.65,
-  "priority_weights": {
-    "cmdb": 1.0,
-    "wiki": 0.6,
-    "pdf": 0.3
-  },
+
   "grounding_min_coverage": 0.8,
-  "include_prompt": false
+  "include_prompt": false,
+  "log_level": "INFO"
 }

@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+.venv/
+venv/
+
+# Secrets / local settings
+.env
+*.env.local
+
+# Generated indexes and caches (rebuilt automatically)
+index_cache/
+RAG_Pipeline_Graph/.graph_index/
+RAG_Pipeline_Structured/.index/
+graph_index_cache/
+demo_graph_data/
+
+# Generated outputs
+results*.json
+!RAG_Pipeline_Graph/sample_data/*.json
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

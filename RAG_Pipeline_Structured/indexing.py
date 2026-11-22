@@ -13,7 +13,7 @@ class IndexManager:
     def __init__(self, config: RAGConfig):
         self.config = config
         self.index_dir = Path(config.index_dir)
-        self.index_dir.mkdir(exist_ok=True)
+        self.index_dir.mkdir(parents=True, exist_ok=True)
         self.embedder = SentenceTransformer(config.embedding_model)
         self.embedder.to(config.device)
         self.dense_index = None

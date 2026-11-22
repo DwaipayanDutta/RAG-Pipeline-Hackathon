@@ -1,0 +1,8 @@
+# Dependencies for RAG_Pipeline_Jev: the Standard RAG stack plus the optional Jev reranker.
+#   pip install -r RAG_Pipeline_Jev/requirements.txt
+# (pip resolves the -r path relative to this file.)
+-r ../RAG_Pipeline_Simple/requirements.txt
+
+# Optional: Jev reranking & gating (--use-jev). Also needs TYPESAFE_API_KEY in the environment.
+# Without it the pipeline logs a warning and runs as Standard RAG.
+jev-reranker>=0.1.0

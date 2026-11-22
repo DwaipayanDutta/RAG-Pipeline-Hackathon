@@ -1,0 +1,9 @@
+# Extra dependencies for rag_pipeline_graph.py. Install on top of the existing requirements:
+#   pip install -r requirements_graph.txt
+#   python -m spacy download en_core_web_sm
+# jev-reranker is not needed here and stays optional for rag_pipeline_jev.py.
+-r requirements.txt
+chromadb
+spacy
+# Only for generating the demo PDF via --seed-demo (not used by the pipeline itself):
+reportlab

@@ -1,0 +1,38 @@
+{
+  "chunk_size": 400,
+  "chunk_overlap": 80,
+  "embedding_model": "sentence-transformers/all-MiniLM-L6-v2",
+  "generation_model": "google/flan-t5-base",
+  "entity_extraction_model": "google/flan-t5-base",
+  "spacy_model": "en_core_web_sm",
+  "max_context_tokens": 512,
+  "max_answer_tokens": 150,
+  "index_dir": "graph_index_cache",
+  "db_path": "demo_graph_data/cmdb.sqlite",
+  "db_table": "services",
+  "db_key_column": "service_name",
+  "wiki_dir": "demo_graph_data/wiki",
+  "pdf_dir": "demo_graph_data/pdfs",
+  "use_llm_wiki_extraction": true,
+  "known_entities": [
+    "payments-service",
+    "checkout-service"
+  ],
+  "graph_top_k": 10,
+  "graph_hops": 1,
+  "traversal_predicates": [
+    "on_call_engineer",
+    "owner_team",
+    "depends_on",
+    "member_of"
+  ],
+  "vector_fallback_top_k": 2,
+  "vector_max_distance": 0.65,
+  "priority_weights": {
+    "cmdb": 1.0,
+    "wiki": 0.6,
+    "pdf": 0.3
+  },
+  "grounding_min_coverage": 0.8,
+  "include_prompt": false
+}
